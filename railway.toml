@@ -1,0 +1,15 @@
+[build]
+builder = "dockerfile"
+
+[deploy]
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+restartPolicyType = "on_failure"
+
+[environment]
+PORT = "8080"
+NODE_ENV = "production"
+PUPPETEER_SKIP_CHROMIUM_DOWNLOAD = "true"
+PUPPETEER_EXECUTABLE_PATH = "/usr/bin/google-chrome-stable"
+PUPPETEER_CACHE_DIR = "/tmp/.cache/puppeteer"
+FRONTEND_URL = "https://preview--curious-code-exploration.lovable.app"
