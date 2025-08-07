@@ -4,9 +4,15 @@ const { default: makeWASocket, DisconnectReason, useMultiFileAuthState } = requi
 const QRCode = require('qrcode');
 const path = require('path');
 const fs = require('fs');
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// Initialize Supabase client
+const supabaseUrl = process.env.SUPABASE_URL || 'https://tovnbcputrcfznsnccef.supabase.co';
+const supabaseKey = process.env.SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRvdm5iY3B1dHJjZnpuc25jY2VmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTE0MjQ5MTIsImV4cCI6MjA2NzAwMDkxMn0.7X9cFnxI389pviWP2U2BAAoPOw-nrfoQk8jSdn3bBpc';
+const supabase = createClient(supabaseUrl, supabaseKey);
 
 // Middleware
 app.use(cors());
@@ -16,6 +22,7 @@ app.use(express.json());
 let sock = null;
 let qrCodeData = null;
 let isConnected = false;
+const SESSION_ID = 'default_session';
 
 // Create auth directory if it doesn't exist
 const authDir = path.join(__dirname, 'auth');
@@ -40,12 +47,26 @@ async function initializeWhatsApp() {
             if (qr) {
                 console.log('QR Code generated');
                 qrCodeData = await QRCode.toDataURL(qr);
+                
+                // Save QR code to Supabase
+                await updateConnectionInSupabase({
+                    session_id: SESSION_ID,
+                    is_connected: false,
+                    qr_code: qrCodeData
+                });
             }
             
             if (connection === 'close') {
                 const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
                 console.log('Connection closed due to ', lastDisconnect?.error, ', reconnecting ', shouldReconnect);
                 isConnected = false;
+                
+                // Update connection status in Supabase
+                await updateConnectionInSupabase({
+                    session_id: SESSION_ID,
+                    is_connected: false,
+                    qr_code: null
+                });
                 
                 if (shouldReconnect) {
                     setTimeout(() => initializeWhatsApp(), 3000);
@@ -54,6 +75,14 @@ async function initializeWhatsApp() {
                 console.log('WhatsApp connected successfully');
                 isConnected = true;
                 qrCodeData = null; // Clear QR code when connected
+                
+                // Update connection status in Supabase
+                await updateConnectionInSupabase({
+                    session_id: SESSION_ID,
+                    is_connected: true,
+                    qr_code: null,
+                    phone_number: sock?.user?.id || null
+                });
             }
         });
 
@@ -62,6 +91,45 @@ async function initializeWhatsApp() {
     } catch (error) {
         console.error('Error initializing WhatsApp:', error);
         setTimeout(() => initializeWhatsApp(), 5000);
+    }
+}
+
+// Helper function to update connection status in Supabase
+async function updateConnectionInSupabase(data) {
+    try {
+        const { error } = await supabase
+            .from('whatsapp_connections')
+            .upsert(data, { 
+                onConflict: 'session_id',
+                ignoreDuplicates: false 
+            });
+        
+        if (error) {
+            console.error('Error updating Supabase:', error);
+        }
+    } catch (err) {
+        console.error('Error connecting to Supabase:', err);
+    }
+}
+
+// Helper function to get connection from Supabase
+async function getConnectionFromSupabase(sessionId) {
+    try {
+        const { data, error } = await supabase
+            .from('whatsapp_connections')
+            .select('*')
+            .eq('session_id', sessionId)
+            .single();
+        
+        if (error && error.code !== 'PGRST116') {
+            console.error('Error fetching from Supabase:', error);
+            return null;
+        }
+        
+        return data;
+    } catch (err) {
+        console.error('Error connecting to Supabase:', err);
+        return null;
     }
 }
 
@@ -153,6 +221,35 @@ app.post('/api/whatsapp/send-message', async (req, res) => {
         res.status(500).json({ 
             success: false, 
             message: 'Failed to send message' 
+        });
+    }
+});
+
+app.post('/api/whatsapp/send-test-message', async (req, res) => {
+    try {
+        if (!isConnected || !sock) {
+            return res.status(400).json({ 
+                success: false, 
+                message: 'WhatsApp is not connected' 
+            });
+        }
+
+        // Send test message to the predefined number
+        const testNumber = '+919106403233';
+        const testMessage = 'Hello! This is a test message from your WhatsApp Web integration. Connection is working perfectly! 🚀';
+        
+        const formattedNumber = testNumber.replace(/[+\s-]/g, '') + '@s.whatsapp.net';
+        await sock.sendMessage(formattedNumber, { text: testMessage });
+
+        res.json({ 
+            success: true, 
+            message: 'Test message sent successfully to ' + testNumber
+        });
+    } catch (error) {
+        console.error('Error sending test message:', error);
+        res.status(500).json({ 
+            success: false, 
+            message: 'Failed to send test message' 
         });
     }
 });
