@@ -30,22 +30,6 @@ if (!fs.existsSync(authDir)) {
     fs.mkdirSync(authDir, { recursive: true });
 }
 
-// Helper function to clean up session files  
-async function cleanupSessionFiles() {
-    try {
-        const files = fs.readdirSync(authDir);
-        for (const file of files) {
-            const filePath = path.join(authDir, file);
-            if (fs.existsSync(filePath)) {
-                fs.unlinkSync(filePath);
-                console.log(`Deleted session file: ${file}`);
-            }
-        }
-    } catch (error) {
-        console.error('Error cleaning up session files:', error);
-    }
-}
-
 // Initialize WhatsApp connection
 async function initializeWhatsApp() {
     try {
@@ -54,10 +38,7 @@ async function initializeWhatsApp() {
         sock = makeWASocket({
             auth: state,
             printQRInTerminal: false,
-            browser: ['WhatsApp Web', 'Chrome', '1.0.0'],
-            connectTimeoutMs: 60000,
-            defaultQueryTimeoutMs: 60000,
-            keepAliveIntervalMs: 10000
+            browser: ['WhatsApp Web', 'Chrome', '1.0.0']
         });
 
         sock.ev.on('connection.update', async (update) => {
@@ -77,11 +58,8 @@ async function initializeWhatsApp() {
             
             if (connection === 'close') {
                 const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-                const disconnectReason = lastDisconnect?.error?.output?.statusCode;
-                
-                console.log('Connection closed. Reason:', disconnectReason, 'Should reconnect:', shouldReconnect);
+                console.log('Connection closed due to ', lastDisconnect?.error, ', reconnecting ', shouldReconnect);
                 isConnected = false;
-                qrCodeData = null;
                 
                 // Update connection status in Supabase
                 await updateConnectionInSupabase({
@@ -90,16 +68,7 @@ async function initializeWhatsApp() {
                     qr_code: null
                 });
                 
-                // Handle different disconnect reasons
-                if (disconnectReason === DisconnectReason.loggedOut) {
-                    console.log('Logged out - cleaning session files');
-                    await cleanupSessionFiles();
-                } else if (disconnectReason === DisconnectReason.restartRequired) {
-                    console.log('Restart required - cleaning session and restarting');
-                    await cleanupSessionFiles();
-                    setTimeout(() => initializeWhatsApp(), 2000);
-                } else if (shouldReconnect) {
-                    // For other disconnect reasons, try to reconnect after a delay
+                if (shouldReconnect) {
                     setTimeout(() => initializeWhatsApp(), 3000);
                 }
             } else if (connection === 'open') {
@@ -114,8 +83,6 @@ async function initializeWhatsApp() {
                     qr_code: null,
                     phone_number: sock?.user?.id || null
                 });
-            } else if (connection === 'connecting') {
-                console.log('WhatsApp connecting...');
             }
         });
 
@@ -123,13 +90,7 @@ async function initializeWhatsApp() {
         
     } catch (error) {
         console.error('Error initializing WhatsApp:', error);
-        
-        // Clean session files and retry
-        setTimeout(async () => {
-            console.log('Cleaning session files and retrying...');
-            await cleanupSessionFiles();
-            initializeWhatsApp();
-        }, 5000);
+        setTimeout(() => initializeWhatsApp(), 5000);
     }
 }
 
@@ -191,23 +152,14 @@ app.post('/api/whatsapp/generate-qr', async (req, res) => {
         }
 
         if (!sock) {
-            initializeWhatsApp();
+            await initializeWhatsApp();
         }
 
         // Wait for QR code generation
         let attempts = 0;
-        const maxAttempts = 30;
-        
-        while (!qrCodeData && attempts < maxAttempts && !isConnected) {
+        while (!qrCodeData && attempts < 30) {
             await new Promise(resolve => setTimeout(resolve, 1000));
             attempts++;
-        }
-
-        if (isConnected) {
-            return res.json({ 
-                success: false, 
-                message: 'WhatsApp connected during QR generation' 
-            });
         }
 
         if (qrCodeData) {
@@ -233,9 +185,7 @@ app.post('/api/whatsapp/generate-qr', async (req, res) => {
 app.get('/api/whatsapp/status', (req, res) => {
     res.json({ 
         isConnected: isConnected,
-        hasQR: !!qrCodeData,
-        hasSocket: !!sock,
-        timestamp: new Date().toISOString()
+        hasQR: !!qrCodeData
     });
 });
 
@@ -309,11 +259,9 @@ app.post('/api/whatsapp/disconnect', async (req, res) => {
         if (sock) {
             await sock.logout();
         }
-        sock = null;
         isConnected = false;
         qrCodeData = null;
-        
-        await cleanupSessionFiles();
+        sock = null;
         
         res.json({ 
             success: true, 
