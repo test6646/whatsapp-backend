@@ -30,15 +30,77 @@ if (!fs.existsSync(authDir)) {
     fs.mkdirSync(authDir, { recursive: true });
 }
 
-// Initialize WhatsApp connection
-async function initializeWhatsApp() {
+// Helper function to clean up session files
+async function cleanupSessionFiles() {
     try {
+        const files = fs.readdirSync(authDir);
+        for (const file of files) {
+            const filePath = path.join(authDir, file);
+            if (fs.existsSync(filePath)) {
+                fs.unlinkSync(filePath);
+                console.log(`Deleted session file: ${file}`);
+            }
+        }
+    } catch (error) {
+        console.error('Error cleaning up session files:', error);
+    }
+}
+
+// Helper function to force reset connection
+async function forceResetConnection() {
+    try {
+        console.log('Force resetting WhatsApp connection...');
+        
+        // Close existing socket if it exists
+        if (sock) {
+            try {
+                await sock.logout();
+            } catch (error) {
+                console.log('Error during logout (expected if already disconnected):', error.message);
+            }
+        }
+        
+        // Reset all state variables
+        sock = null;
+        isConnected = false;
+        qrCodeData = null;
+        
+        // Clean up session files
+        await cleanupSessionFiles();
+        
+        // Update Supabase
+        await updateConnectionInSupabase({
+            session_id: SESSION_ID,
+            is_connected: false,
+            qr_code: null,
+            phone_number: null
+        });
+        
+        console.log('Connection reset completed');
+        return true;
+    } catch (error) {
+        console.error('Error during force reset:', error);
+        return false;
+    }
+}
+
+// Initialize WhatsApp connection
+async function initializeWhatsApp(forceReset = false) {
+    try {
+        // If force reset is requested, clean up first
+        if (forceReset) {
+            await forceResetConnection();
+        }
+        
         const { state, saveCreds } = await useMultiFileAuthState(authDir);
         
         sock = makeWASocket({
             auth: state,
             printQRInTerminal: false,
-            browser: ['WhatsApp Web', 'Chrome', '1.0.0']
+            browser: ['WhatsApp Web', 'Chrome', '1.0.0'],
+            connectTimeoutMs: 60000,
+            defaultQueryTimeoutMs: 60000,
+            keepAliveIntervalMs: 10000
         });
 
         sock.ev.on('connection.update', async (update) => {
@@ -58,8 +120,11 @@ async function initializeWhatsApp() {
             
             if (connection === 'close') {
                 const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-                console.log('Connection closed due to ', lastDisconnect?.error, ', reconnecting ', shouldReconnect);
+                const disconnectReason = lastDisconnect?.error?.output?.statusCode;
+                
+                console.log('Connection closed. Reason:', disconnectReason, 'Should reconnect:', shouldReconnect);
                 isConnected = false;
+                qrCodeData = null;
                 
                 // Update connection status in Supabase
                 await updateConnectionInSupabase({
@@ -68,7 +133,16 @@ async function initializeWhatsApp() {
                     qr_code: null
                 });
                 
-                if (shouldReconnect) {
+                // Handle different disconnect reasons
+                if (disconnectReason === DisconnectReason.loggedOut) {
+                    console.log('Logged out - cleaning session files');
+                    await cleanupSessionFiles();
+                } else if (disconnectReason === DisconnectReason.restartRequired) {
+                    console.log('Restart required - cleaning session and restarting');
+                    await cleanupSessionFiles();
+                    setTimeout(() => initializeWhatsApp(true), 2000);
+                } else if (shouldReconnect) {
+                    // For other disconnect reasons, try to reconnect after a delay
                     setTimeout(() => initializeWhatsApp(), 3000);
                 }
             } else if (connection === 'open') {
@@ -83,14 +157,26 @@ async function initializeWhatsApp() {
                     qr_code: null,
                     phone_number: sock?.user?.id || null
                 });
+            } else if (connection === 'connecting') {
+                console.log('WhatsApp connecting...');
             }
         });
 
         sock.ev.on('creds.update', saveCreds);
         
+        // Add connection monitoring
+        sock.ev.on('connection.state', (state) => {
+            console.log('Connection state changed:', state);
+        });
+        
     } catch (error) {
         console.error('Error initializing WhatsApp:', error);
-        setTimeout(() => initializeWhatsApp(), 5000);
+        
+        // If initialization fails, try force reset after a delay
+        setTimeout(() => {
+            console.log('Retrying with force reset...');
+            initializeWhatsApp(true);
+        }, 5000);
     }
 }
 
@@ -144,40 +230,67 @@ app.get('/', (req, res) => {
 
 app.post('/api/whatsapp/generate-qr', async (req, res) => {
     try {
-        if (isConnected) {
+        const { forceReset } = req.body;
+        
+        if (isConnected && !forceReset) {
             return res.json({ 
                 success: false, 
-                message: 'WhatsApp is already connected' 
+                message: 'WhatsApp is already connected. Use forceReset to disconnect first.' 
             });
         }
 
-        if (!sock) {
-            await initializeWhatsApp();
+        // If force reset is requested or socket doesn't exist, initialize with reset
+        if (forceReset || !sock) {
+            console.log('Initializing WhatsApp with force reset...');
+            await initializeWhatsApp(true);
         }
 
-        // Wait for QR code generation
+        // Wait for QR code generation with improved timeout handling
         let attempts = 0;
-        while (!qrCodeData && attempts < 30) {
+        const maxAttempts = 45; // Increased timeout to 45 seconds
+        
+        while (!qrCodeData && attempts < maxAttempts && !isConnected) {
             await new Promise(resolve => setTimeout(resolve, 1000));
             attempts++;
+            
+            // Log progress every 10 seconds
+            if (attempts % 10 === 0) {
+                console.log(`Waiting for QR code... ${attempts}/${maxAttempts} seconds`);
+            }
+        }
+
+        if (isConnected) {
+            return res.json({ 
+                success: false, 
+                message: 'WhatsApp connected during QR generation' 
+            });
         }
 
         if (qrCodeData) {
             res.json({ 
                 success: true, 
-                qrCode: qrCodeData 
+                qrCode: qrCodeData,
+                message: 'QR code generated successfully'
             });
         } else {
+            // If QR generation failed, try force reset and return error
+            console.log('QR generation failed, attempting force reset...');
+            await forceResetConnection();
+            
             res.status(500).json({ 
                 success: false, 
-                message: 'Failed to generate QR code' 
+                message: 'Failed to generate QR code after timeout. Connection has been reset, please try again.' 
             });
         }
     } catch (error) {
         console.error('Error generating QR code:', error);
+        
+        // On error, try to reset connection
+        await forceResetConnection();
+        
         res.status(500).json({ 
             success: false, 
-            message: 'Internal server error' 
+            message: 'Internal server error. Connection has been reset, please try again.' 
         });
     }
 });
@@ -185,7 +298,9 @@ app.post('/api/whatsapp/generate-qr', async (req, res) => {
 app.get('/api/whatsapp/status', (req, res) => {
     res.json({ 
         isConnected: isConnected,
-        hasQR: !!qrCodeData
+        hasQR: !!qrCodeData,
+        hasSocket: !!sock,
+        timestamp: new Date().toISOString()
     });
 });
 
@@ -256,22 +371,50 @@ app.post('/api/whatsapp/send-test-message', async (req, res) => {
 
 app.post('/api/whatsapp/disconnect', async (req, res) => {
     try {
-        if (sock) {
-            await sock.logout();
-        }
-        isConnected = false;
-        qrCodeData = null;
-        sock = null;
+        const resetResult = await forceResetConnection();
         
-        res.json({ 
-            success: true, 
-            message: 'WhatsApp disconnected successfully' 
-        });
+        if (resetResult) {
+            res.json({ 
+                success: true, 
+                message: 'WhatsApp disconnected and session cleaned successfully' 
+            });
+        } else {
+            res.status(500).json({ 
+                success: false, 
+                message: 'Error during disconnect process' 
+            });
+        }
     } catch (error) {
         console.error('Error disconnecting WhatsApp:', error);
         res.status(500).json({ 
             success: false, 
             message: 'Error disconnecting WhatsApp' 
+        });
+    }
+});
+
+// Add force reset endpoint
+app.post('/api/whatsapp/force-reset', async (req, res) => {
+    try {
+        console.log('Force reset requested');
+        const resetResult = await forceResetConnection();
+        
+        if (resetResult) {
+            res.json({ 
+                success: true, 
+                message: 'WhatsApp connection force reset completed' 
+            });
+        } else {
+            res.status(500).json({ 
+                success: false, 
+                message: 'Error during force reset' 
+            });
+        }
+    } catch (error) {
+        console.error('Error during force reset:', error);
+        res.status(500).json({ 
+            success: false, 
+            message: 'Error during force reset' 
         });
     }
 });
