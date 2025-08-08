@@ -29,6 +29,9 @@ const SESSION_ID = 'my-bot';
 let sock = null;
 let isConnected = false;
 let lastQrString = null;
+let reconnectAttempts = 0;
+let sessionSaveTimeout = null;
+let lastSessionSave = 0;
 
 // --- Supabase helpers for session persistence ---
 /**
@@ -177,13 +180,34 @@ async function initializeWhatsApp() {
         isConnected = false;
         lastQrString = null;
         
+        // Handle specific error codes
+        if (statusCode === 440) {
+          console.log('[WA] ⚠️ Session conflict detected (Error 440) - Another device may be using this account');
+          reconnectAttempts++;
+          
+          if (reconnectAttempts > 3) {
+            console.log('[WA] 🛑 Too many conflict errors. Clearing session and stopping reconnection.');
+            await supabase.from('wa_sessions').delete().eq('id', SESSION_ID);
+            return;
+          }
+          
+          // Wait longer for conflicts
+          const backoffDelay = Math.min(30000 * reconnectAttempts, 120000); // 30s, 60s, 90s, max 2min
+          console.log(`[WA] Waiting ${backoffDelay/1000}s before retry due to conflict...`);
+          setTimeout(initializeWhatsApp, backoffDelay);
+          return;
+        }
+        
         if (shouldReconnect) {
-          console.log('[WA] Reconnecting in 3 seconds...');
-          setTimeout(initializeWhatsApp, 3000);
+          reconnectAttempts++;
+          const backoffDelay = Math.min(3000 * reconnectAttempts, 30000); // Exponential backoff, max 30s
+          console.log(`[WA] Reconnecting in ${backoffDelay/1000}s... (attempt ${reconnectAttempts})`);
+          setTimeout(initializeWhatsApp, backoffDelay);
         } else {
           console.log('[WA] Logged out. Session cleared.');
+          reconnectAttempts = 0;
           // Clear session from Supabase when logged out
-          await saveSessionToSupabase(null);
+          await supabase.from('wa_sessions').delete().eq('id', SESSION_ID);
           // Clean up session directory
           try {
             if (fs.existsSync(sessionDir)) {
@@ -197,19 +221,33 @@ async function initializeWhatsApp() {
         console.log('[WA] ✅ Connected to WhatsApp successfully!');
         isConnected = true;
         lastQrString = null;
+        reconnectAttempts = 0; // Reset on successful connection
       }
     });
 
-    // CRITICAL FIX: Save credentials to Supabase whenever they update
+    // CRITICAL FIX: Debounced session saving to prevent excessive writes
     sock.ev.on('creds.update', async () => {
       try {
         console.log('[Auth] Credentials updated, saving to local files first...');
         await saveCreds();
         
-        // Wait a bit for files to be written properly
-        setTimeout(async () => {
+        // Clear any existing timeout
+        if (sessionSaveTimeout) {
+          clearTimeout(sessionSaveTimeout);
+        }
+        
+        // Debounce session saves - only save after 5 seconds of no updates
+        sessionSaveTimeout = setTimeout(async () => {
           try {
-            // Read all session files and save to Supabase
+            const now = Date.now();
+            
+            // Don't save more than once every 10 seconds
+            if (now - lastSessionSave < 10000) {
+              console.log('[Auth] 🔄 Skipping session save - too frequent (last save was', Math.round((now - lastSessionSave)/1000), 's ago)');
+              return;
+            }
+            
+            console.log('[Auth] 💾 Starting debounced session save to Supabase...');
             const sessionData = { creds: null, keys: {} };
             
             // Read credentials
@@ -217,27 +255,30 @@ async function initializeWhatsApp() {
             if (fs.existsSync(credsPath)) {
               const credsContent = fs.readFileSync(credsPath, 'utf8');
               sessionData.creds = JSON.parse(credsContent);
-              console.log('[Auth] ✅ Read creds.json for Supabase sync');
             }
             
-            // Read all key files
+            // Read all key files (only read, don't log every file)
             const files = fs.readdirSync(sessionDir);
+            let keyCount = 0;
             files.forEach(file => {
               if (file.endsWith('.json') && file !== 'creds.json') {
                 try {
                   const keyName = file.replace('.json', '');
                   const keyContent = fs.readFileSync(path.join(sessionDir, file), 'utf8');
                   sessionData.keys[keyName] = JSON.parse(keyContent);
-                  console.log('[Auth] ✅ Read', file, 'for Supabase sync');
+                  keyCount++;
                 } catch (e) {
                   console.error('[Auth] Failed to read key file', file, ':', e);
                 }
               }
             });
             
+            console.log(`[Auth] 📦 Read ${keyCount} key files and credentials for Supabase sync`);
+            
             // Only save if we have valid session data
             if (sessionData.creds || Object.keys(sessionData.keys).length > 0) {
               await saveSessionToSupabase(sessionData);
+              lastSessionSave = now;
             } else {
               console.warn('[Auth] No valid session data to save to Supabase');
             }
@@ -245,7 +286,7 @@ async function initializeWhatsApp() {
           } catch (e) {
             console.error('[Auth] Failed to read session files for Supabase sync:', e);
           }
-        }, 1000); // Wait 1 second for files to be written
+        }, 5000); // Wait 5 seconds before saving
         
       } catch (e) {
         console.error('[Auth] creds.update handler error:', e);
