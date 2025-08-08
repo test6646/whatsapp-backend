@@ -49,11 +49,12 @@ async function loadSessionFromSupabase() {
       return null;
     }
 
-    if (data?.session_data) {
-      console.log('[Auth] Session data found in Supabase');
+    // CRITICAL FIX: Check for both data existence AND valid session_data
+    if (data && data.session_data && typeof data.session_data === 'object') {
+      console.log('[Auth] Valid session data found in Supabase:', Object.keys(data.session_data));
       return data.session_data;
     } else {
-      console.log('[Auth] No existing session found in Supabase (first-time scan expected)');
+      console.log('[Auth] No valid session found in Supabase - data:', data);
       return null;
     }
   } catch (err) {
@@ -68,7 +69,13 @@ async function loadSessionFromSupabase() {
  */
 async function saveSessionToSupabase(sessionData) {
   try {
-    console.log('[Auth] Saving session to Supabase...');
+    // CRITICAL FIX: Validate session data before saving
+    if (!sessionData || typeof sessionData !== 'object') {
+      console.error('[Auth] Invalid session data - cannot save to Supabase:', sessionData);
+      return;
+    }
+
+    console.log('[Auth] Saving session to Supabase with keys:', Object.keys(sessionData));
     const { error } = await supabase
       .from('wa_sessions')
       .upsert({ 
@@ -78,7 +85,7 @@ async function saveSessionToSupabase(sessionData) {
       }, { onConflict: 'id' });
 
     if (error) {
-      console.error('[Supabase] saveSession error:', error.message);
+      console.error('[Supabase] saveSession error:', error.message, error.details);
     } else {
       console.log('[Auth] Session successfully saved to Supabase');
     }
@@ -101,27 +108,43 @@ async function initializeWhatsApp() {
     // Initialize auth state with useMultiFileAuthState
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
     
-    // Load existing session from Supabase and restore it
+    // CRITICAL FIX: Load existing session from Supabase and restore it properly
     const savedSession = await loadSessionFromSupabase();
-    if (savedSession) {
+    if (savedSession && savedSession.creds) {
       console.log('[Auth] Restoring session from Supabase...');
-      // Write session files to the temp directory
       try {
+        // Write credentials file
         if (savedSession.creds) {
-          fs.writeFileSync(path.join(sessionDir, 'creds.json'), JSON.stringify(savedSession.creds));
+          fs.writeFileSync(path.join(sessionDir, 'creds.json'), JSON.stringify(savedSession.creds, null, 2));
+          console.log('[Auth] ✅ Restored creds.json');
         }
-        if (savedSession.keys) {
+        
+        // Write all key files
+        if (savedSession.keys && typeof savedSession.keys === 'object') {
           Object.entries(savedSession.keys).forEach(([key, value]) => {
-            fs.writeFileSync(path.join(sessionDir, `${key}.json`), JSON.stringify(value));
+            if (value && typeof value === 'object') {
+              fs.writeFileSync(path.join(sessionDir, `${key}.json`), JSON.stringify(value, null, 2));
+              console.log('[Auth] ✅ Restored', key + '.json');
+            }
           });
         }
-        // Reload state after restoring files
+        
+        console.log('[Auth] ✅ Session files restored successfully');
+        
+        // Reinitialize auth state to load the restored session
         const { state: restoredState, saveCreds: restoredSaveCreds } = await useMultiFileAuthState(sessionDir);
-        state.creds = restoredState.creds;
-        state.keys = restoredState.keys;
+        // Replace the state and saveCreds function with restored ones
+        Object.assign(state, restoredState);
+        saveCreds = restoredSaveCreds;
+        
       } catch (e) {
-        console.error('[Auth] Failed to restore session files:', e);
+        console.error('[Auth] ❌ Failed to restore session files:', e);
+        // Clear corrupted session from Supabase
+        await supabase.from('wa_sessions').delete().eq('id', SESSION_ID);
+        console.log('[Auth] Cleared corrupted session from Supabase');
       }
+    } else {
+      console.log('[Auth] No valid session to restore - starting fresh');
     }
 
     sock = makeWASocket({
@@ -177,32 +200,53 @@ async function initializeWhatsApp() {
       }
     });
 
-    // Save credentials to Supabase whenever they update
+    // CRITICAL FIX: Save credentials to Supabase whenever they update
     sock.ev.on('creds.update', async () => {
       try {
-        console.log('[Auth] Credentials updated, saving to Supabase...');
+        console.log('[Auth] Credentials updated, saving to local files first...');
         await saveCreds();
         
-        // Read all session files and save to Supabase
-        const sessionData = { creds: null, keys: {} };
-        try {
-          if (fs.existsSync(path.join(sessionDir, 'creds.json'))) {
-            sessionData.creds = JSON.parse(fs.readFileSync(path.join(sessionDir, 'creds.json'), 'utf8'));
-          }
-          
-          // Read all key files
-          const files = fs.readdirSync(sessionDir);
-          files.forEach(file => {
-            if (file.endsWith('.json') && file !== 'creds.json') {
-              const keyName = file.replace('.json', '');
-              sessionData.keys[keyName] = JSON.parse(fs.readFileSync(path.join(sessionDir, file), 'utf8'));
+        // Wait a bit for files to be written properly
+        setTimeout(async () => {
+          try {
+            // Read all session files and save to Supabase
+            const sessionData = { creds: null, keys: {} };
+            
+            // Read credentials
+            const credsPath = path.join(sessionDir, 'creds.json');
+            if (fs.existsSync(credsPath)) {
+              const credsContent = fs.readFileSync(credsPath, 'utf8');
+              sessionData.creds = JSON.parse(credsContent);
+              console.log('[Auth] ✅ Read creds.json for Supabase sync');
             }
-          });
-          
-          await saveSessionToSupabase(sessionData);
-        } catch (e) {
-          console.error('[Auth] Failed to read session files for Supabase sync:', e);
-        }
+            
+            // Read all key files
+            const files = fs.readdirSync(sessionDir);
+            files.forEach(file => {
+              if (file.endsWith('.json') && file !== 'creds.json') {
+                try {
+                  const keyName = file.replace('.json', '');
+                  const keyContent = fs.readFileSync(path.join(sessionDir, file), 'utf8');
+                  sessionData.keys[keyName] = JSON.parse(keyContent);
+                  console.log('[Auth] ✅ Read', file, 'for Supabase sync');
+                } catch (e) {
+                  console.error('[Auth] Failed to read key file', file, ':', e);
+                }
+              }
+            });
+            
+            // Only save if we have valid session data
+            if (sessionData.creds || Object.keys(sessionData.keys).length > 0) {
+              await saveSessionToSupabase(sessionData);
+            } else {
+              console.warn('[Auth] No valid session data to save to Supabase');
+            }
+            
+          } catch (e) {
+            console.error('[Auth] Failed to read session files for Supabase sync:', e);
+          }
+        }, 1000); // Wait 1 second for files to be written
+        
       } catch (e) {
         console.error('[Auth] creds.update handler error:', e);
       }
