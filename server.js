@@ -8,7 +8,7 @@ const { createClient } = require('@supabase/supabase-js');
 const {
   default: makeWASocket,
   DisconnectReason,
-  useSingleFileAuthState,
+  useMultiFileAuthState,
 } = require('@whiskeysockets/baileys');
 
 // --- Basic server setup ---
@@ -25,16 +25,17 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 // --- Session persistence config ---
 const TABLE = 'whatsapp_sessions';
 const SESSION_ID = 'my-bot';
-const AUTH_FILE = path.join('/tmp', `${SESSION_ID}-auth.json`); // Render-friendly
+const AUTH_DIR = path.join('/tmp', `${SESSION_ID}-auth`); // for multi-file auth
 
 // Runtime state
 let sock = null;
 let isConnected = false;
 let lastQrString = null; // keep latest QR (if needed by endpoints/UI)
 
-// Ensure /tmp exists (it does on Render, but safe locally too)
+// Ensure /tmp and auth dir exist (Render provides /tmp)
 try {
   fs.mkdirSync('/tmp', { recursive: true });
+  fs.mkdirSync(AUTH_DIR, { recursive: true });
 } catch (_) {}
 
 // --- Supabase helpers for session persistence ---
@@ -46,7 +47,7 @@ async function ensureSessionRow() {
   if (error) console.error('[Supabase] ensureSessionRow error:', error.message);
 }
 
-async function loadSessionFromSupabaseToFile() {
+async function loadSessionFromSupabaseToDir() {
   try {
     const { data, error } = await supabase
       .from(TABLE)
@@ -59,9 +60,16 @@ async function loadSessionFromSupabaseToFile() {
       return;
     }
 
-    if (data?.session_data) {
-      fs.writeFileSync(AUTH_FILE, JSON.stringify(data.session_data, null, 2), 'utf-8');
-      console.log('[Auth] Loaded session from Supabase into file');
+    const files = data?.session_data?.files;
+    if (files && typeof files === 'object') {
+      // Recreate auth directory structure
+      fs.mkdirSync(AUTH_DIR, { recursive: true });
+      for (const relPath of Object.keys(files)) {
+        const absPath = path.join(AUTH_DIR, relPath);
+        fs.mkdirSync(path.dirname(absPath), { recursive: true });
+        fs.writeFileSync(absPath, files[relPath], 'utf-8');
+      }
+      console.log('[Auth] Loaded session from Supabase into auth dir');
     } else {
       console.log('[Auth] No existing session found in Supabase (first-time scan expected)');
     }
@@ -70,18 +78,34 @@ async function loadSessionFromSupabaseToFile() {
   }
 }
 
-async function syncSessionFileToSupabase() {
-  try {
-    if (!fs.existsSync(AUTH_FILE)) {
-      console.warn('[Auth] Auth file not found to sync');
-      return;
+function readDirFilesAsMap(dir, base = dir) {
+  const map = {};
+  if (!fs.existsSync(dir)) return map;
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const abs = path.join(dir, entry.name);
+    const rel = path.relative(base, abs).replace(/\\/g, '/');
+    if (entry.isDirectory()) {
+      Object.assign(map, readDirFilesAsMap(abs, base));
+    } else {
+      try {
+        const content = fs.readFileSync(abs, 'utf-8');
+        map[rel] = content;
+      } catch (e) {
+        console.warn('[Auth] Failed reading file for sync:', rel, e?.message);
+      }
     }
-    const raw = fs.readFileSync(AUTH_FILE, 'utf-8');
-    const json = raw ? JSON.parse(raw) : {};
+  }
+  return map;
+}
+
+async function syncSessionDirToSupabase() {
+  try {
+    const filesMap = readDirFilesAsMap(AUTH_DIR);
+    const payload = { files: filesMap };
 
     const { error } = await supabase
       .from(TABLE)
-      .upsert({ id: SESSION_ID, session_data: json, updated_at: new Date().toISOString() }, { onConflict: 'id' });
+      .upsert({ id: SESSION_ID, session_data: payload, updated_at: new Date().toISOString() }, { onConflict: 'id' });
 
     if (error) console.error('[Supabase] syncSession error:', error.message);
     else console.log('[Auth] Session synced to Supabase');
@@ -94,13 +118,13 @@ async function syncSessionFileToSupabase() {
 async function initializeWhatsApp() {
   try {
     await ensureSessionRow();
-    await loadSessionFromSupabaseToFile();
+    await loadSessionFromSupabaseToDir();
 
-    const { state, saveCreds } = useSingleFileAuthState(AUTH_FILE);
+    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
     sock = makeWASocket({
       auth: state,
-      printQRInTerminal: false, // we'll print manually for more control
+      printQRInTerminal: false, // we'll render ourselves and send to UI
       browser: ['WhatsApp Web', 'Chrome', '1.0.0'],
       syncFullHistory: false,
     });
@@ -136,7 +160,7 @@ async function initializeWhatsApp() {
     sock.ev.on('creds.update', async () => {
       try {
         await saveCreds();
-        await syncSessionFileToSupabase();
+        await syncSessionDirToSupabase();
       } catch (e) {
         console.error('[Auth] creds.update handler error:', e);
       }
@@ -154,6 +178,18 @@ app.get('/', (req, res) => {
 
 app.get('/api/whatsapp/status', (req, res) => {
   res.json({ isConnected, hasQR: !!lastQrString });
+});
+
+// Return latest QR as a data URL for the frontend to render
+app.get('/api/whatsapp/qr', async (req, res) => {
+  try {
+    if (!lastQrString) return res.status(404).json({ success: false, message: 'QR not available yet' });
+    const dataUrl = await QRCode.toDataURL(lastQrString, { margin: 1, scale: 8 });
+    return res.json({ success: true, qrCode: dataUrl });
+  } catch (e) {
+    console.error('qr endpoint error:', e);
+    return res.status(500).json({ success: false, message: 'Failed to render QR' });
+  }
 });
 
 app.post('/api/whatsapp/generate-qr', async (req, res) => {
@@ -191,9 +227,10 @@ app.post('/api/whatsapp/disconnect', async (req, res) => {
     isConnected = false;
     lastQrString = null;
 
-    // Clear local file but keep Supabase row (so first scan can recreate)
+    // Clear local auth dir but keep Supabase row (so first scan can recreate)
     try {
-      if (fs.existsSync(AUTH_FILE)) fs.unlinkSync(AUTH_FILE);
+      if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+      fs.mkdirSync(AUTH_DIR, { recursive: true });
       await supabase
         .from(TABLE)
         .upsert({ id: SESSION_ID, session_data: null, updated_at: new Date().toISOString() }, { onConflict: 'id' });
