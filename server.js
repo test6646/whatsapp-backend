@@ -1,293 +1,225 @@
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const { default: makeWASocket, DisconnectReason, useMultiFileAuthState } = require('@whiskeysockets/baileys');
-const QRCode = require('qrcode');
-const path = require('path');
 const fs = require('fs');
+const path = require('path');
+const QRCode = require('qrcode');
 const { createClient } = require('@supabase/supabase-js');
+const {
+  default: makeWASocket,
+  DisconnectReason,
+  useSingleFileAuthState,
+} = require('@whiskeysockets/baileys');
 
+// --- Basic server setup ---
 const app = express();
 const PORT = process.env.PORT || 3001;
-
-// Initialize Supabase client
-const supabaseUrl = process.env.SUPABASE_URL || 'https://tovnbcputrcfznsnccef.supabase.co';
-const supabaseKey = process.env.SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRvdm5iY3B1dHJjZnpuc25jY2VmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTE0MjQ5MTIsImV4cCI6MjA2NzAwMDkxMn0.7X9cFnxI389pviWP2U2BAAoPOw-nrfoQk8jSdn3bBpc';
-const supabase = createClient(supabaseUrl, supabaseKey);
-
-// Middleware
 app.use(cors());
 app.use(express.json());
 
-// Global variables
+// --- Supabase client ---
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+// --- Session persistence config ---
+const TABLE = 'whatsapp_sessions';
+const SESSION_ID = 'my-bot';
+const AUTH_FILE = path.join('/tmp', `${SESSION_ID}-auth.json`); // Render-friendly
+
+// Runtime state
 let sock = null;
-let qrCodeData = null;
 let isConnected = false;
-const SESSION_ID = 'default_session';
+let lastQrString = null; // keep latest QR (if needed by endpoints/UI)
 
-// Create auth directory if it doesn't exist
-const authDir = path.join(__dirname, 'auth');
-if (!fs.existsSync(authDir)) {
-    fs.mkdirSync(authDir, { recursive: true });
+// Ensure /tmp exists (it does on Render, but safe locally too)
+try {
+  fs.mkdirSync('/tmp', { recursive: true });
+} catch (_) {}
+
+// --- Supabase helpers for session persistence ---
+async function ensureSessionRow() {
+  // Creates the row if it doesn't exist yet
+  const { error } = await supabase
+    .from(TABLE)
+    .upsert({ id: SESSION_ID, session_data: null, updated_at: new Date().toISOString() }, { onConflict: 'id' });
+  if (error) console.error('[Supabase] ensureSessionRow error:', error.message);
 }
 
-// Initialize WhatsApp connection
+async function loadSessionFromSupabaseToFile() {
+  try {
+    const { data, error } = await supabase
+      .from(TABLE)
+      .select('session_data')
+      .eq('id', SESSION_ID)
+      .maybeSingle();
+
+    if (error) {
+      console.error('[Supabase] loadSession error:', error.message);
+      return;
+    }
+
+    if (data?.session_data) {
+      fs.writeFileSync(AUTH_FILE, JSON.stringify(data.session_data, null, 2), 'utf-8');
+      console.log('[Auth] Loaded session from Supabase into file');
+    } else {
+      console.log('[Auth] No existing session found in Supabase (first-time scan expected)');
+    }
+  } catch (err) {
+    console.error('[Auth] Failed to load session from Supabase:', err);
+  }
+}
+
+async function syncSessionFileToSupabase() {
+  try {
+    if (!fs.existsSync(AUTH_FILE)) {
+      console.warn('[Auth] Auth file not found to sync');
+      return;
+    }
+    const raw = fs.readFileSync(AUTH_FILE, 'utf-8');
+    const json = raw ? JSON.parse(raw) : {};
+
+    const { error } = await supabase
+      .from(TABLE)
+      .upsert({ id: SESSION_ID, session_data: json, updated_at: new Date().toISOString() }, { onConflict: 'id' });
+
+    if (error) console.error('[Supabase] syncSession error:', error.message);
+    else console.log('[Auth] Session synced to Supabase');
+  } catch (err) {
+    console.error('[Auth] Failed syncing session to Supabase:', err);
+  }
+}
+
+// --- WhatsApp init ---
 async function initializeWhatsApp() {
-    try {
-        const { state, saveCreds } = await useMultiFileAuthState(authDir);
-        
-        sock = makeWASocket({
-            auth: state,
-            printQRInTerminal: false,
-            browser: ['WhatsApp Web', 'Chrome', '1.0.0']
-        });
+  try {
+    await ensureSessionRow();
+    await loadSessionFromSupabaseToFile();
 
-        sock.ev.on('connection.update', async (update) => {
-            const { connection, lastDisconnect, qr } = update;
-            
-            if (qr) {
-                console.log('QR Code generated');
-                qrCodeData = await QRCode.toDataURL(qr);
-                
-                // Save QR code to Supabase
-                await updateConnectionInSupabase({
-                    session_id: SESSION_ID,
-                    is_connected: false,
-                    qr_code: qrCodeData
-                });
-            }
-            
-            if (connection === 'close') {
-                const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-                console.log('Connection closed due to ', lastDisconnect?.error, ', reconnecting ', shouldReconnect);
-                isConnected = false;
-                
-                // Update connection status in Supabase
-                await updateConnectionInSupabase({
-                    session_id: SESSION_ID,
-                    is_connected: false,
-                    qr_code: null
-                });
-                
-                if (shouldReconnect) {
-                    setTimeout(() => initializeWhatsApp(), 3000);
-                }
-            } else if (connection === 'open') {
-                console.log('WhatsApp connected successfully');
-                isConnected = true;
-                qrCodeData = null; // Clear QR code when connected
-                
-                // Update connection status in Supabase
-                await updateConnectionInSupabase({
-                    session_id: SESSION_ID,
-                    is_connected: true,
-                    qr_code: null,
-                    phone_number: sock?.user?.id || null
-                });
-            }
-        });
+    const { state, saveCreds } = useSingleFileAuthState(AUTH_FILE);
 
-        sock.ev.on('creds.update', saveCreds);
-        
-    } catch (error) {
-        console.error('Error initializing WhatsApp:', error);
-        setTimeout(() => initializeWhatsApp(), 5000);
-    }
-}
-
-// Helper function to update connection status in Supabase
-async function updateConnectionInSupabase(data) {
-    try {
-        const { error } = await supabase
-            .from('whatsapp_connections')
-            .upsert(data, { 
-                onConflict: 'session_id',
-                ignoreDuplicates: false 
-            });
-        
-        if (error) {
-            console.error('Error updating Supabase:', error);
-        }
-    } catch (err) {
-        console.error('Error connecting to Supabase:', err);
-    }
-}
-
-// Helper function to get connection from Supabase
-async function getConnectionFromSupabase(sessionId) {
-    try {
-        const { data, error } = await supabase
-            .from('whatsapp_connections')
-            .select('*')
-            .eq('session_id', sessionId)
-            .single();
-        
-        if (error && error.code !== 'PGRST116') {
-            console.error('Error fetching from Supabase:', error);
-            return null;
-        }
-        
-        return data;
-    } catch (err) {
-        console.error('Error connecting to Supabase:', err);
-        return null;
-    }
-}
-
-// Routes
-app.get('/', (req, res) => {
-    res.json({ 
-        message: 'WhatsApp Backend API is running',
-        status: 'online',
-        connected: isConnected
+    sock = makeWASocket({
+      auth: state,
+      printQRInTerminal: false, // we'll print manually for more control
+      browser: ['WhatsApp Web', 'Chrome', '1.0.0'],
+      syncFullHistory: false,
     });
-});
 
-app.post('/api/whatsapp/generate-qr', async (req, res) => {
-    try {
-        if (isConnected) {
-            return res.json({ 
-                success: false, 
-                message: 'WhatsApp is already connected' 
-            });
-        }
+    sock.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect, qr } = update;
 
-        if (!sock) {
-            await initializeWhatsApp();
+      if (qr) {
+        lastQrString = qr;
+        try {
+          const terminalQR = await QRCode.toString(qr, { type: 'terminal', small: true });
+          console.log('\nScan this QR with WhatsApp:');
+          console.log(terminalQR);
+        } catch (e) {
+          console.error('Failed to render QR in terminal:', e);
         }
+      }
 
-        // Wait for QR code generation
-        let attempts = 0;
-        while (!qrCodeData && attempts < 30) {
-            await new Promise(resolve => setTimeout(resolve, 1000));
-            attempts++;
-        }
+      if (connection === 'close') {
+        const statusCode = (lastDisconnect?.error)?.output?.statusCode;
+        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+        console.log('[WA] Connection closed. Code:', statusCode, 'Reconnect:', shouldReconnect);
+        isConnected = false;
+        if (shouldReconnect) setTimeout(initializeWhatsApp, 3000);
+      } else if (connection === 'open') {
+        console.log('[WA] Connected');
+        isConnected = true;
+        lastQrString = null;
+      }
+    });
 
-        if (qrCodeData) {
-            res.json({ 
-                success: true, 
-                qrCode: qrCodeData 
-            });
-        } else {
-            res.status(500).json({ 
-                success: false, 
-                message: 'Failed to generate QR code' 
-            });
-        }
-    } catch (error) {
-        console.error('Error generating QR code:', error);
-        res.status(500).json({ 
-            success: false, 
-            message: 'Internal server error' 
-        });
-    }
+    // Persist creds + sync to Supabase every time they change
+    sock.ev.on('creds.update', async () => {
+      try {
+        await saveCreds();
+        await syncSessionFileToSupabase();
+      } catch (e) {
+        console.error('[Auth] creds.update handler error:', e);
+      }
+    });
+  } catch (error) {
+    console.error('[WA] initialize error:', error);
+    setTimeout(initializeWhatsApp, 5000);
+  }
+}
+
+// --- Express routes (kept minimal and compatible) ---
+app.get('/', (req, res) => {
+  res.json({ message: 'WhatsApp Backend API running', connected: isConnected });
 });
 
 app.get('/api/whatsapp/status', (req, res) => {
-    res.json({ 
-        isConnected: isConnected,
-        hasQR: !!qrCodeData
-    });
+  res.json({ isConnected, hasQR: !!lastQrString });
+});
+
+app.post('/api/whatsapp/generate-qr', async (req, res) => {
+  try {
+    if (!sock) await initializeWhatsApp();
+
+    // We don't force regeneration; Baileys emits a new QR periodically.
+    // Here we just return a hint; actual QR is printed in the server console.
+    res.json({ success: true, message: 'QR printed in server console', hasQR: !!lastQrString });
+  } catch (e) {
+    console.error('generate-qr error:', e);
+    res.status(500).json({ success: false, message: 'Failed to start WhatsApp' });
+  }
 });
 
 app.post('/api/whatsapp/send-message', async (req, res) => {
-    try {
-        const { number, message } = req.body;
+  try {
+    const { number, message } = req.body;
+    if (!sock || !isConnected) return res.status(400).json({ success: false, message: 'WhatsApp not connected' });
+    if (!number || !message) return res.status(400).json({ success: false, message: 'number and message required' });
 
-        if (!isConnected || !sock) {
-            return res.status(400).json({ 
-                success: false, 
-                message: 'WhatsApp is not connected' 
-            });
-        }
-
-        if (!number || !message) {
-            return res.status(400).json({ 
-                success: false, 
-                message: 'Phone number and message are required' 
-            });
-        }
-
-        // Format phone number (remove + and spaces)
-        const formattedNumber = number.replace(/[+\s-]/g, '') + '@s.whatsapp.net';
-
-        await sock.sendMessage(formattedNumber, { text: message });
-
-        res.json({ 
-            success: true, 
-            message: 'Message sent successfully' 
-        });
-    } catch (error) {
-        console.error('Error sending message:', error);
-        res.status(500).json({ 
-            success: false, 
-            message: 'Failed to send message' 
-        });
-    }
-});
-
-app.post('/api/whatsapp/send-test-message', async (req, res) => {
-    try {
-        if (!isConnected || !sock) {
-            return res.status(400).json({ 
-                success: false, 
-                message: 'WhatsApp is not connected' 
-            });
-        }
-
-        // Send test message to the predefined number
-        const testNumber = '+919106403233';
-        const testMessage = 'Hello! This is a test message from your WhatsApp Web integration. Connection is working perfectly! 🚀';
-        
-        const formattedNumber = testNumber.replace(/[+\s-]/g, '') + '@s.whatsapp.net';
-        await sock.sendMessage(formattedNumber, { text: testMessage });
-
-        res.json({ 
-            success: true, 
-            message: 'Test message sent successfully to ' + testNumber
-        });
-    } catch (error) {
-        console.error('Error sending test message:', error);
-        res.status(500).json({ 
-            success: false, 
-            message: 'Failed to send test message' 
-        });
-    }
+    const jid = number.replace(/[+\s-]/g, '') + '@s.whatsapp.net';
+    await sock.sendMessage(jid, { text: message });
+    res.json({ success: true });
+  } catch (e) {
+    console.error('send-message error:', e);
+    res.status(500).json({ success: false, message: 'Failed to send message' });
+  }
 });
 
 app.post('/api/whatsapp/disconnect', async (req, res) => {
+  try {
+    if (sock) await sock.logout();
+    sock = null;
+    isConnected = false;
+    lastQrString = null;
+
+    // Clear local file but keep Supabase row (so first scan can recreate)
     try {
-        if (sock) {
-            await sock.logout();
-        }
-        isConnected = false;
-        qrCodeData = null;
-        sock = null;
-        
-        res.json({ 
-            success: true, 
-            message: 'WhatsApp disconnected successfully' 
-        });
-    } catch (error) {
-        console.error('Error disconnecting WhatsApp:', error);
-        res.status(500).json({ 
-            success: false, 
-            message: 'Error disconnecting WhatsApp' 
-        });
+      if (fs.existsSync(AUTH_FILE)) fs.unlinkSync(AUTH_FILE);
+      await supabase
+        .from(TABLE)
+        .upsert({ id: SESSION_ID, session_data: null, updated_at: new Date().toISOString() }, { onConflict: 'id' });
+    } catch (e) {
+      console.error('[Auth] cleanup after disconnect error:', e);
     }
+
+    res.json({ success: true, message: 'Disconnected' });
+  } catch (e) {
+    console.error('disconnect error:', e);
+    res.status(500).json({ success: false, message: 'Failed to disconnect' });
+  }
 });
 
-// Start server
+// --- Server start ---
 app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-    console.log('Initializing WhatsApp connection...');
-    initializeWhatsApp();
+  console.log(`Server running on port ${PORT}`);
+  console.log('Initializing WhatsApp...');
+  initializeWhatsApp();
 });
 
-// Graceful shutdown
+// --- Graceful shutdown ---
 process.on('SIGINT', async () => {
-    console.log('Shutting down gracefully...');
-    if (sock) {
-        await sock.logout();
-    }
-    process.exit(0);
+  console.log('Shutting down...');
+  try {
+    if (sock) await sock.logout();
+  } catch (_) {}
+  process.exit(0);
 });
