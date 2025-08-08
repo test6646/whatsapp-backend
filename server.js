@@ -6,8 +6,10 @@ const { createClient } = require('@supabase/supabase-js');
 const {
   default: makeWASocket,
   DisconnectReason,
-  useSingleFileAuthState,
+  useMultiFileAuthState,
 } = require('@whiskeysockets/baileys');
+const fs = require('fs');
+const path = require('path');
 
 // --- Basic server setup ---
 const app = express();
@@ -90,11 +92,37 @@ async function initializeWhatsApp() {
   try {
     console.log('[WA] Initializing WhatsApp with Supabase session persistence...');
     
-    // Load existing session from Supabase
-    const savedSession = await loadSessionFromSupabase();
+    // Create a temporary session directory
+    const sessionDir = './wa_session';
+    if (!fs.existsSync(sessionDir)) {
+      fs.mkdirSync(sessionDir, { recursive: true });
+    }
     
-    // Initialize auth state with useSingleFileAuthState
-    const { state, saveCreds } = useSingleFileAuthState(savedSession);
+    // Initialize auth state with useMultiFileAuthState
+    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+    
+    // Load existing session from Supabase and restore it
+    const savedSession = await loadSessionFromSupabase();
+    if (savedSession) {
+      console.log('[Auth] Restoring session from Supabase...');
+      // Write session files to the temp directory
+      try {
+        if (savedSession.creds) {
+          fs.writeFileSync(path.join(sessionDir, 'creds.json'), JSON.stringify(savedSession.creds));
+        }
+        if (savedSession.keys) {
+          Object.entries(savedSession.keys).forEach(([key, value]) => {
+            fs.writeFileSync(path.join(sessionDir, `${key}.json`), JSON.stringify(value));
+          });
+        }
+        // Reload state after restoring files
+        const { state: restoredState, saveCreds: restoredSaveCreds } = await useMultiFileAuthState(sessionDir);
+        state.creds = restoredState.creds;
+        state.keys = restoredState.keys;
+      } catch (e) {
+        console.error('[Auth] Failed to restore session files:', e);
+      }
+    }
 
     sock = makeWASocket({
       auth: state,
@@ -133,6 +161,14 @@ async function initializeWhatsApp() {
           console.log('[WA] Logged out. Session cleared.');
           // Clear session from Supabase when logged out
           await saveSessionToSupabase(null);
+          // Clean up session directory
+          try {
+            if (fs.existsSync(sessionDir)) {
+              fs.rmSync(sessionDir, { recursive: true, force: true });
+            }
+          } catch (e) {
+            console.error('[Auth] Failed to cleanup session directory:', e);
+          }
         }
       } else if (connection === 'open') {
         console.log('[WA] ✅ Connected to WhatsApp successfully!');
@@ -146,8 +182,27 @@ async function initializeWhatsApp() {
       try {
         console.log('[Auth] Credentials updated, saving to Supabase...');
         await saveCreds();
-        // Get the current state and save to Supabase
-        await saveSessionToSupabase(state.creds);
+        
+        // Read all session files and save to Supabase
+        const sessionData = { creds: null, keys: {} };
+        try {
+          if (fs.existsSync(path.join(sessionDir, 'creds.json'))) {
+            sessionData.creds = JSON.parse(fs.readFileSync(path.join(sessionDir, 'creds.json'), 'utf8'));
+          }
+          
+          // Read all key files
+          const files = fs.readdirSync(sessionDir);
+          files.forEach(file => {
+            if (file.endsWith('.json') && file !== 'creds.json') {
+              const keyName = file.replace('.json', '');
+              sessionData.keys[keyName] = JSON.parse(fs.readFileSync(path.join(sessionDir, file), 'utf8'));
+            }
+          });
+          
+          await saveSessionToSupabase(sessionData);
+        } catch (e) {
+          console.error('[Auth] Failed to read session files for Supabase sync:', e);
+        }
       } catch (e) {
         console.error('[Auth] creds.update handler error:', e);
       }
@@ -206,6 +261,22 @@ app.post('/api/whatsapp/send-message', async (req, res) => {
   } catch (e) {
     console.error('send-message error:', e);
     res.status(500).json({ success: false, message: 'Failed to send message' });
+  }
+});
+
+app.post('/api/whatsapp/send-test-message', async (req, res) => {
+  try {
+    if (!sock || !isConnected) return res.status(400).json({ success: false, message: 'WhatsApp not connected' });
+
+    const testNumber = '+919106403233';
+    const testMessage = '🎉 Test message from your WhatsApp integration! Connection is working perfectly.';
+    
+    const jid = testNumber.replace(/[+\s-]/g, '') + '@s.whatsapp.net';
+    await sock.sendMessage(jid, { text: testMessage });
+    res.json({ success: true, message: 'Test message sent successfully!' });
+  } catch (e) {
+    console.error('send-test-message error:', e);
+    res.status(500).json({ success: false, message: 'Failed to send test message' });
   }
 });
 
