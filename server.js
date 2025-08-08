@@ -106,7 +106,7 @@ async function initializeWhatsApp() {
     }
     
     // Initialize auth state with useMultiFileAuthState
-    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+    let { state, saveCreds } = await useMultiFileAuthState(sessionDir);
     
     // CRITICAL FIX: Load existing session from Supabase and restore it properly
     const savedSession = await loadSessionFromSupabase();
@@ -131,11 +131,11 @@ async function initializeWhatsApp() {
         
         console.log('[Auth] ✅ Session files restored successfully');
         
-        // Reinitialize auth state to load the restored session
-        const { state: restoredState, saveCreds: restoredSaveCreds } = await useMultiFileAuthState(sessionDir);
+        // FIXED: Reinitialize auth state to load the restored session
+        const restored = await useMultiFileAuthState(sessionDir);
         // Replace the state and saveCreds function with restored ones
-        Object.assign(state, restoredState);
-        saveCreds = restoredSaveCreds;
+        Object.assign(state, restored.state);
+        saveCreds = restored.saveCreds;
         
       } catch (e) {
         console.error('[Auth] ❌ Failed to restore session files:', e);
