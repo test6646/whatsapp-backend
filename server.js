@@ -1,14 +1,12 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const fs = require('fs');
-const path = require('path');
 const QRCode = require('qrcode');
 const { createClient } = require('@supabase/supabase-js');
 const {
   default: makeWASocket,
   DisconnectReason,
-  useMultiFileAuthState,
+  useSingleFileAuthState,
 } = require('@whiskeysockets/baileys');
 
 // --- Basic server setup ---
@@ -23,108 +21,84 @@ const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 // --- Session persistence config ---
-const TABLE = 'whatsapp_sessions';
 const SESSION_ID = 'my-bot';
-const AUTH_DIR = path.join('/tmp', `${SESSION_ID}-auth`); // for multi-file auth
 
 // Runtime state
 let sock = null;
 let isConnected = false;
-let lastQrString = null; // keep latest QR (if needed by endpoints/UI)
-
-// Ensure /tmp and auth dir exist (Render provides /tmp)
-try {
-  fs.mkdirSync('/tmp', { recursive: true });
-  fs.mkdirSync(AUTH_DIR, { recursive: true });
-} catch (_) {}
+let lastQrString = null;
 
 // --- Supabase helpers for session persistence ---
-async function ensureSessionRow() {
-  // Creates the row if it doesn't exist yet
-  const { error } = await supabase
-    .from(TABLE)
-    .upsert({ id: SESSION_ID, session_data: null, updated_at: new Date().toISOString() }, { onConflict: 'id' });
-  if (error) console.error('[Supabase] ensureSessionRow error:', error.message);
-}
-
-async function loadSessionFromSupabaseToDir() {
+/**
+ * Load session data from Supabase wa_sessions table
+ * @returns {Object|null} Session data object or null if not found
+ */
+async function loadSessionFromSupabase() {
   try {
+    console.log('[Auth] Loading session from Supabase...');
     const { data, error } = await supabase
-      .from(TABLE)
+      .from('wa_sessions')
       .select('session_data')
       .eq('id', SESSION_ID)
       .maybeSingle();
 
     if (error) {
       console.error('[Supabase] loadSession error:', error.message);
-      return;
+      return null;
     }
 
-    const files = data?.session_data?.files;
-    if (files && typeof files === 'object') {
-      // Recreate auth directory structure
-      fs.mkdirSync(AUTH_DIR, { recursive: true });
-      for (const relPath of Object.keys(files)) {
-        const absPath = path.join(AUTH_DIR, relPath);
-        fs.mkdirSync(path.dirname(absPath), { recursive: true });
-        fs.writeFileSync(absPath, files[relPath], 'utf-8');
-      }
-      console.log('[Auth] Loaded session from Supabase into auth dir');
+    if (data?.session_data) {
+      console.log('[Auth] Session data found in Supabase');
+      return data.session_data;
     } else {
       console.log('[Auth] No existing session found in Supabase (first-time scan expected)');
+      return null;
     }
   } catch (err) {
     console.error('[Auth] Failed to load session from Supabase:', err);
+    return null;
   }
 }
 
-function readDirFilesAsMap(dir, base = dir) {
-  const map = {};
-  if (!fs.existsSync(dir)) return map;
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    const abs = path.join(dir, entry.name);
-    const rel = path.relative(base, abs).replace(/\\/g, '/');
-    if (entry.isDirectory()) {
-      Object.assign(map, readDirFilesAsMap(abs, base));
-    } else {
-      try {
-        const content = fs.readFileSync(abs, 'utf-8');
-        map[rel] = content;
-      } catch (e) {
-        console.warn('[Auth] Failed reading file for sync:', rel, e?.message);
-      }
-    }
-  }
-  return map;
-}
-
-async function syncSessionDirToSupabase() {
+/**
+ * Save session data to Supabase wa_sessions table
+ * @param {Object} sessionData - The session data to save
+ */
+async function saveSessionToSupabase(sessionData) {
   try {
-    const filesMap = readDirFilesAsMap(AUTH_DIR);
-    const payload = { files: filesMap };
-
+    console.log('[Auth] Saving session to Supabase...');
     const { error } = await supabase
-      .from(TABLE)
-      .upsert({ id: SESSION_ID, session_data: payload, updated_at: new Date().toISOString() }, { onConflict: 'id' });
+      .from('wa_sessions')
+      .upsert({ 
+        id: SESSION_ID, 
+        session_data: sessionData,
+        updated_at: new Date().toISOString() 
+      }, { onConflict: 'id' });
 
-    if (error) console.error('[Supabase] syncSession error:', error.message);
-    else console.log('[Auth] Session synced to Supabase');
+    if (error) {
+      console.error('[Supabase] saveSession error:', error.message);
+    } else {
+      console.log('[Auth] Session successfully saved to Supabase');
+    }
   } catch (err) {
-    console.error('[Auth] Failed syncing session to Supabase:', err);
+    console.error('[Auth] Failed to save session to Supabase:', err);
   }
 }
 
 // --- WhatsApp init ---
 async function initializeWhatsApp() {
   try {
-    await ensureSessionRow();
-    await loadSessionFromSupabaseToDir();
-
-    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+    console.log('[WA] Initializing WhatsApp with Supabase session persistence...');
+    
+    // Load existing session from Supabase
+    const savedSession = await loadSessionFromSupabase();
+    
+    // Initialize auth state with useSingleFileAuthState
+    const { state, saveCreds } = useSingleFileAuthState(savedSession);
 
     sock = makeWASocket({
       auth: state,
-      printQRInTerminal: false, // we'll render ourselves and send to UI
+      printQRInTerminal: false, // we'll handle QR display ourselves
       browser: ['WhatsApp Web', 'Chrome', '1.0.0'],
       syncFullHistory: false,
     });
@@ -135,9 +109,11 @@ async function initializeWhatsApp() {
       if (qr) {
         lastQrString = qr;
         try {
+          // Print QR to console for debugging
           const terminalQR = await QRCode.toString(qr, { type: 'terminal', small: true });
-          console.log('\nScan this QR with WhatsApp:');
+          console.log('\n📱 Scan this QR code with WhatsApp:');
           console.log(terminalQR);
+          console.log('QR Code available at: GET /api/whatsapp/qr\n');
         } catch (e) {
           console.error('Failed to render QR in terminal:', e);
         }
@@ -146,27 +122,40 @@ async function initializeWhatsApp() {
       if (connection === 'close') {
         const statusCode = (lastDisconnect?.error)?.output?.statusCode;
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-        console.log('[WA] Connection closed. Code:', statusCode, 'Reconnect:', shouldReconnect);
+        console.log('[WA] Connection closed. Code:', statusCode, 'Should reconnect:', shouldReconnect);
         isConnected = false;
-        if (shouldReconnect) setTimeout(initializeWhatsApp, 3000);
+        lastQrString = null;
+        
+        if (shouldReconnect) {
+          console.log('[WA] Reconnecting in 3 seconds...');
+          setTimeout(initializeWhatsApp, 3000);
+        } else {
+          console.log('[WA] Logged out. Session cleared.');
+          // Clear session from Supabase when logged out
+          await saveSessionToSupabase(null);
+        }
       } else if (connection === 'open') {
-        console.log('[WA] Connected');
+        console.log('[WA] ✅ Connected to WhatsApp successfully!');
         isConnected = true;
         lastQrString = null;
       }
     });
 
-    // Persist creds + sync to Supabase every time they change
+    // Save credentials to Supabase whenever they update
     sock.ev.on('creds.update', async () => {
       try {
+        console.log('[Auth] Credentials updated, saving to Supabase...');
         await saveCreds();
-        await syncSessionDirToSupabase();
+        // Get the current state and save to Supabase
+        await saveSessionToSupabase(state.creds);
       } catch (e) {
         console.error('[Auth] creds.update handler error:', e);
       }
     });
+
   } catch (error) {
-    console.error('[WA] initialize error:', error);
+    console.error('[WA] Initialize error:', error);
+    console.log('[WA] Retrying in 5 seconds...');
     setTimeout(initializeWhatsApp, 5000);
   }
 }
@@ -222,26 +211,28 @@ app.post('/api/whatsapp/send-message', async (req, res) => {
 
 app.post('/api/whatsapp/disconnect', async (req, res) => {
   try {
-    if (sock) await sock.logout();
+    console.log('[WA] Disconnecting WhatsApp...');
+    
+    if (sock) {
+      await sock.logout();
+    }
+    
     sock = null;
     isConnected = false;
     lastQrString = null;
 
-    // Clear local auth dir but keep Supabase row (so first scan can recreate)
+    // Clear session from Supabase
     try {
-      if (fs.existsSync(AUTH_DIR)) fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-      fs.mkdirSync(AUTH_DIR, { recursive: true });
-      await supabase
-        .from(TABLE)
-        .upsert({ id: SESSION_ID, session_data: null, updated_at: new Date().toISOString() }, { onConflict: 'id' });
+      await saveSessionToSupabase(null);
+      console.log('[Auth] Session cleared from Supabase');
     } catch (e) {
-      console.error('[Auth] cleanup after disconnect error:', e);
+      console.error('[Auth] Failed to clear session from Supabase:', e);
     }
 
-    res.json({ success: true, message: 'Disconnected' });
+    res.json({ success: true, message: 'WhatsApp disconnected and session cleared' });
   } catch (e) {
-    console.error('disconnect error:', e);
-    res.status(500).json({ success: false, message: 'Failed to disconnect' });
+    console.error('[WA] Disconnect error:', e);
+    res.status(500).json({ success: false, message: 'Failed to disconnect WhatsApp' });
   }
 });
 
