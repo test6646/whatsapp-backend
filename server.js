@@ -53,17 +53,18 @@ async function loadSessionFromSupabase(firmId) {
     console.log(`[Auth] Loading session from Supabase for firm: ${firmId}...`);
     const { data, error } = await supabase
       .from('wa_sessions')
-      .select('session_data')
+      .select('session_data, firm_id')
       .eq('id', firmId)
+      .eq('firm_id', firmId) // CRITICAL: Ensure firm ownership
       .maybeSingle();
 
     if (error) {
-      console.error('[Supabase] loadSession error:', error.message);
+      console.error(`[Supabase] loadSession error for firm ${firmId}:`, error.message);
       return null;
     }
 
-    // CRITICAL FIX: Check for both data existence AND valid session_data
-    if (data && data.session_data && typeof data.session_data === 'object') {
+    // CRITICAL FIX: Check for both data existence AND valid session_data AND correct firm
+    if (data && data.session_data && typeof data.session_data === 'object' && data.firm_id === firmId) {
       console.log(`[Auth] Valid session data found in Supabase for firm ${firmId}:`, Object.keys(data.session_data));
       return data.session_data;
     } else {
@@ -86,7 +87,7 @@ async function saveSessionToSupabase(firmId, sessionData) {
     // Handle clearing session
     if (!sessionData) {
       console.log(`[Auth] Clearing session from Supabase for firm: ${firmId}`);
-      await supabase.from('wa_sessions').delete().eq('id', firmId);
+      await supabase.from('wa_sessions').delete().eq('id', firmId).eq('firm_id', firmId); // CRITICAL: Ensure firm ownership
       return;
     }
 
@@ -101,6 +102,7 @@ async function saveSessionToSupabase(firmId, sessionData) {
       .from('wa_sessions')
       .upsert({ 
         id: firmId, 
+        firm_id: firmId, // CRITICAL: Set firm_id for firm ownership
         session_data: sessionData,
         updated_at: new Date().toISOString() 
       }, { onConflict: 'id' });
