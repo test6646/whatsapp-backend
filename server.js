@@ -23,28 +23,38 @@ const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 // --- Session persistence config ---
-const SESSION_ID = 'my-bot';
+// Runtime state - now supports multiple firm sessions
+const firmSessions = new Map(); // Map<firmId, { sock, isConnected, lastQrString, reconnectAttempts, sessionSaveTimeout, lastSessionSave }>
+let currentFirmId = null;
 
-// Runtime state
-let sock = null;
-let isConnected = false;
-let lastQrString = null;
-let reconnectAttempts = 0;
-let sessionSaveTimeout = null;
-let lastSessionSave = 0;
+// --- Helper functions for firm session management ---
+function getFirmSession(firmId) {
+  if (!firmSessions.has(firmId)) {
+    firmSessions.set(firmId, {
+      sock: null,
+      isConnected: false,
+      lastQrString: null,
+      reconnectAttempts: 0,
+      sessionSaveTimeout: null,
+      lastSessionSave: 0
+    });
+  }
+  return firmSessions.get(firmId);
+}
 
 // --- Supabase helpers for session persistence ---
 /**
- * Load session data from Supabase wa_sessions table
+ * Load session data from Supabase wa_sessions table for specific firm
+ * @param {string} firmId - The firm ID
  * @returns {Object|null} Session data object or null if not found
  */
-async function loadSessionFromSupabase() {
+async function loadSessionFromSupabase(firmId) {
   try {
-    console.log('[Auth] Loading session from Supabase...');
+    console.log(`[Auth] Loading session from Supabase for firm: ${firmId}...`);
     const { data, error } = await supabase
       .from('wa_sessions')
       .select('session_data')
-      .eq('id', SESSION_ID)
+      .eq('id', firmId)
       .maybeSingle();
 
     if (error) {
@@ -54,56 +64,72 @@ async function loadSessionFromSupabase() {
 
     // CRITICAL FIX: Check for both data existence AND valid session_data
     if (data && data.session_data && typeof data.session_data === 'object') {
-      console.log('[Auth] Valid session data found in Supabase:', Object.keys(data.session_data));
+      console.log(`[Auth] Valid session data found in Supabase for firm ${firmId}:`, Object.keys(data.session_data));
       return data.session_data;
     } else {
-      console.log('[Auth] No valid session found in Supabase - data:', data);
+      console.log(`[Auth] No valid session found in Supabase for firm ${firmId} - data:`, data);
       return null;
     }
   } catch (err) {
-    console.error('[Auth] Failed to load session from Supabase:', err);
+    console.error(`[Auth] Failed to load session from Supabase for firm ${firmId}:`, err);
     return null;
   }
 }
 
 /**
- * Save session data to Supabase wa_sessions table
+ * Save session data to Supabase wa_sessions table for specific firm
+ * @param {string} firmId - The firm ID
  * @param {Object} sessionData - The session data to save
  */
-async function saveSessionToSupabase(sessionData) {
+async function saveSessionToSupabase(firmId, sessionData) {
   try {
-    // CRITICAL FIX: Validate session data before saving
-    if (!sessionData || typeof sessionData !== 'object') {
-      console.error('[Auth] Invalid session data - cannot save to Supabase:', sessionData);
+    // Handle clearing session
+    if (!sessionData) {
+      console.log(`[Auth] Clearing session from Supabase for firm: ${firmId}`);
+      await supabase.from('wa_sessions').delete().eq('id', firmId);
       return;
     }
 
-    console.log('[Auth] Saving session to Supabase with keys:', Object.keys(sessionData));
+    // CRITICAL FIX: Validate session data before saving
+    if (typeof sessionData !== 'object') {
+      console.error(`[Auth] Invalid session data for firm ${firmId} - cannot save to Supabase:`, sessionData);
+      return;
+    }
+
+    console.log(`[Auth] Saving session to Supabase for firm ${firmId} with keys:`, Object.keys(sessionData));
     const { error } = await supabase
       .from('wa_sessions')
       .upsert({ 
-        id: SESSION_ID, 
+        id: firmId, 
         session_data: sessionData,
         updated_at: new Date().toISOString() 
       }, { onConflict: 'id' });
 
     if (error) {
-      console.error('[Supabase] saveSession error:', error.message, error.details);
+      console.error(`[Supabase] saveSession error for firm ${firmId}:`, error.message, error.details);
     } else {
-      console.log('[Auth] Session successfully saved to Supabase');
+      console.log(`[Auth] Session successfully saved to Supabase for firm ${firmId}`);
     }
   } catch (err) {
-    console.error('[Auth] Failed to save session to Supabase:', err);
+    console.error(`[Auth] Failed to save session to Supabase for firm ${firmId}:`, err);
   }
 }
 
-// --- WhatsApp init ---
-async function initializeWhatsApp() {
+// --- WhatsApp init for specific firm ---
+async function initializeWhatsApp(firmId) {
+  if (!firmId) {
+    console.error('[WA] No firm ID provided for WhatsApp initialization');
+    return;
+  }
+
+  const firmSession = getFirmSession(firmId);
+  currentFirmId = firmId;
+
   try {
-    console.log('[WA] Initializing WhatsApp with Supabase session persistence...');
+    console.log(`[WA] Initializing WhatsApp for firm: ${firmId} with Supabase session persistence...`);
     
-    // Create a temporary session directory
-    const sessionDir = './wa_session';
+    // Create a firm-specific session directory
+    const sessionDir = `./wa_session_${firmId}`;
     if (!fs.existsSync(sessionDir)) {
       fs.mkdirSync(sessionDir, { recursive: true });
     }
@@ -111,10 +137,10 @@ async function initializeWhatsApp() {
     // Initialize auth state with useMultiFileAuthState
     let { state, saveCreds } = await useMultiFileAuthState(sessionDir);
     
-    // CRITICAL FIX: Load existing session from Supabase and restore it properly
-    const savedSession = await loadSessionFromSupabase();
+    // Load existing session from Supabase and restore it properly
+    const savedSession = await loadSessionFromSupabase(firmId);
     if (savedSession && savedSession.creds) {
-      console.log('[Auth] Restoring session from Supabase...');
+      console.log(`[Auth] Restoring session from Supabase for firm ${firmId}...`);
       try {
         // Write credentials file
         if (savedSession.creds) {
@@ -134,40 +160,38 @@ async function initializeWhatsApp() {
         
         console.log('[Auth] ✅ Session files restored successfully');
         
-        // FIXED: Reinitialize auth state to load the restored session
+        // Reinitialize auth state to load the restored session
         const restored = await useMultiFileAuthState(sessionDir);
-        // Replace the state and saveCreds function with restored ones
         Object.assign(state, restored.state);
         saveCreds = restored.saveCreds;
         
       } catch (e) {
         console.error('[Auth] ❌ Failed to restore session files:', e);
         // Clear corrupted session from Supabase
-        await supabase.from('wa_sessions').delete().eq('id', SESSION_ID);
-        console.log('[Auth] Cleared corrupted session from Supabase');
+        await saveSessionToSupabase(firmId, null);
+        console.log(`[Auth] Cleared corrupted session from Supabase for firm ${firmId}`);
       }
     } else {
-      console.log('[Auth] No valid session to restore - starting fresh');
+      console.log(`[Auth] No valid session to restore for firm ${firmId} - starting fresh`);
     }
 
-    sock = makeWASocket({
+    firmSession.sock = makeWASocket({
       auth: state,
-      printQRInTerminal: false, // we'll handle QR display ourselves
+      printQRInTerminal: false,
       browser: ['WhatsApp Web', 'Chrome', '1.0.0'],
       syncFullHistory: false,
     });
 
-    sock.ev.on('connection.update', async (update) => {
+    firmSession.sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
-        lastQrString = qr;
+        firmSession.lastQrString = qr;
         try {
-          // Print QR to console for debugging
           const terminalQR = await QRCode.toString(qr, { type: 'terminal', small: true });
-          console.log('\n📱 Scan this QR code with WhatsApp:');
+          console.log(`\n📱 Scan this QR code with WhatsApp for firm ${firmId}:`);
           console.log(terminalQR);
-          console.log('QR Code available at: GET /api/whatsapp/qr\n');
+          console.log(`QR Code available at: GET /api/whatsapp/qr?firmId=${firmId}\n`);
         } catch (e) {
           console.error('Failed to render QR in terminal:', e);
         }
@@ -176,88 +200,81 @@ async function initializeWhatsApp() {
       if (connection === 'close') {
         const statusCode = (lastDisconnect?.error)?.output?.statusCode;
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-        console.log('[WA] Connection closed. Code:', statusCode, 'Should reconnect:', shouldReconnect);
-        isConnected = false;
-        lastQrString = null;
+        console.log(`[WA] Connection closed for firm ${firmId}. Code:`, statusCode, 'Should reconnect:', shouldReconnect);
+        firmSession.isConnected = false;
+        firmSession.lastQrString = null;
         
         // Handle specific error codes
         if (statusCode === 440) {
-          console.log('[WA] ⚠️ Session conflict detected (Error 440) - Another device may be using this account');
-          reconnectAttempts++;
+          console.log(`[WA] ⚠️ Session conflict detected for firm ${firmId} (Error 440)`);
+          firmSession.reconnectAttempts++;
           
-          if (reconnectAttempts > 3) {
-            console.log('[WA] 🛑 Too many conflict errors. Clearing session and stopping reconnection.');
-            await supabase.from('wa_sessions').delete().eq('id', SESSION_ID);
+          if (firmSession.reconnectAttempts > 3) {
+            console.log(`[WA] 🛑 Too many conflict errors for firm ${firmId}. Clearing session.`);
+            await saveSessionToSupabase(firmId, null);
             return;
           }
           
-          // Wait longer for conflicts
-          const backoffDelay = Math.min(30000 * reconnectAttempts, 120000); // 30s, 60s, 90s, max 2min
-          console.log(`[WA] Waiting ${backoffDelay/1000}s before retry due to conflict...`);
-          setTimeout(initializeWhatsApp, backoffDelay);
+          const backoffDelay = Math.min(30000 * firmSession.reconnectAttempts, 120000);
+          console.log(`[WA] Waiting ${backoffDelay/1000}s before retry for firm ${firmId}...`);
+          setTimeout(() => initializeWhatsApp(firmId), backoffDelay);
           return;
         }
         
         if (shouldReconnect) {
-          reconnectAttempts++;
-          const backoffDelay = Math.min(3000 * reconnectAttempts, 30000); // Exponential backoff, max 30s
-          console.log(`[WA] Reconnecting in ${backoffDelay/1000}s... (attempt ${reconnectAttempts})`);
-          setTimeout(initializeWhatsApp, backoffDelay);
+          firmSession.reconnectAttempts++;
+          const backoffDelay = Math.min(3000 * firmSession.reconnectAttempts, 30000);
+          console.log(`[WA] Reconnecting firm ${firmId} in ${backoffDelay/1000}s... (attempt ${firmSession.reconnectAttempts})`);
+          setTimeout(() => initializeWhatsApp(firmId), backoffDelay);
         } else {
-          console.log('[WA] Logged out. Session cleared.');
-          reconnectAttempts = 0;
-          // Clear session from Supabase when logged out
-          await supabase.from('wa_sessions').delete().eq('id', SESSION_ID);
+          console.log(`[WA] Firm ${firmId} logged out. Session cleared.`);
+          firmSession.reconnectAttempts = 0;
+          await saveSessionToSupabase(firmId, null);
           // Clean up session directory
           try {
             if (fs.existsSync(sessionDir)) {
               fs.rmSync(sessionDir, { recursive: true, force: true });
             }
           } catch (e) {
-            console.error('[Auth] Failed to cleanup session directory:', e);
+            console.error(`[Auth] Failed to cleanup session directory for firm ${firmId}:`, e);
           }
         }
       } else if (connection === 'open') {
-        console.log('[WA] ✅ Connected to WhatsApp successfully!');
-        isConnected = true;
-        lastQrString = null;
-        reconnectAttempts = 0; // Reset on successful connection
+        console.log(`[WA] ✅ Connected to WhatsApp successfully for firm ${firmId}!`);
+        firmSession.isConnected = true;
+        firmSession.lastQrString = null;
+        firmSession.reconnectAttempts = 0;
       }
     });
 
-    // CRITICAL FIX: Debounced session saving to prevent excessive writes
-    sock.ev.on('creds.update', async () => {
+    // Debounced session saving
+    firmSession.sock.ev.on('creds.update', async () => {
       try {
-        console.log('[Auth] Credentials updated, saving to local files first...');
+        console.log(`[Auth] Credentials updated for firm ${firmId}, saving to local files first...`);
         await saveCreds();
         
-        // Clear any existing timeout
-        if (sessionSaveTimeout) {
-          clearTimeout(sessionSaveTimeout);
+        if (firmSession.sessionSaveTimeout) {
+          clearTimeout(firmSession.sessionSaveTimeout);
         }
         
-        // Debounce session saves - only save after 5 seconds of no updates
-        sessionSaveTimeout = setTimeout(async () => {
+        firmSession.sessionSaveTimeout = setTimeout(async () => {
           try {
             const now = Date.now();
             
-            // Don't save more than once every 10 seconds
-            if (now - lastSessionSave < 10000) {
-              console.log('[Auth] 🔄 Skipping session save - too frequent (last save was', Math.round((now - lastSessionSave)/1000), 's ago)');
+            if (now - firmSession.lastSessionSave < 10000) {
+              console.log(`[Auth] 🔄 Skipping session save for firm ${firmId} - too frequent`);
               return;
             }
             
-            console.log('[Auth] 💾 Starting debounced session save to Supabase...');
+            console.log(`[Auth] 💾 Starting debounced session save to Supabase for firm ${firmId}...`);
             const sessionData = { creds: null, keys: {} };
             
-            // Read credentials
             const credsPath = path.join(sessionDir, 'creds.json');
             if (fs.existsSync(credsPath)) {
               const credsContent = fs.readFileSync(credsPath, 'utf8');
               sessionData.creds = JSON.parse(credsContent);
             }
             
-            // Read all key files (only read, don't log every file)
             const files = fs.readdirSync(sessionDir);
             let keyCount = 0;
             files.forEach(file => {
@@ -268,53 +285,83 @@ async function initializeWhatsApp() {
                   sessionData.keys[keyName] = JSON.parse(keyContent);
                   keyCount++;
                 } catch (e) {
-                  console.error('[Auth] Failed to read key file', file, ':', e);
+                  console.error(`[Auth] Failed to read key file ${file} for firm ${firmId}:`, e);
                 }
               }
             });
             
-            console.log(`[Auth] 📦 Read ${keyCount} key files and credentials for Supabase sync`);
+            console.log(`[Auth] 📦 Read ${keyCount} key files and credentials for firm ${firmId} Supabase sync`);
             
-            // Only save if we have valid session data
             if (sessionData.creds || Object.keys(sessionData.keys).length > 0) {
-              await saveSessionToSupabase(sessionData);
-              lastSessionSave = now;
+              await saveSessionToSupabase(firmId, sessionData);
+              firmSession.lastSessionSave = now;
             } else {
-              console.warn('[Auth] No valid session data to save to Supabase');
+              console.warn(`[Auth] No valid session data to save to Supabase for firm ${firmId}`);
             }
             
           } catch (e) {
-            console.error('[Auth] Failed to read session files for Supabase sync:', e);
+            console.error(`[Auth] Failed to read session files for firm ${firmId} Supabase sync:`, e);
           }
-        }, 5000); // Wait 5 seconds before saving
+        }, 5000);
         
       } catch (e) {
-        console.error('[Auth] creds.update handler error:', e);
+        console.error(`[Auth] creds.update handler error for firm ${firmId}:`, e);
       }
     });
 
   } catch (error) {
-    console.error('[WA] Initialize error:', error);
-    console.log('[WA] Retrying in 5 seconds...');
-    setTimeout(initializeWhatsApp, 5000);
+    console.error(`[WA] Initialize error for firm ${firmId}:`, error);
+    console.log(`[WA] Retrying in 5 seconds for firm ${firmId}...`);
+    setTimeout(() => initializeWhatsApp(firmId), 5000);
   }
 }
 
-// --- Express routes (kept minimal and compatible) ---
+// --- Express routes (firm-specific) ---
 app.get('/', (req, res) => {
-  res.json({ message: 'WhatsApp Backend API running', connected: isConnected });
+  const connectedFirms = Array.from(firmSessions.entries())
+    .filter(([firmId, session]) => session.isConnected)
+    .map(([firmId]) => firmId);
+  
+  res.json({ 
+    message: 'WhatsApp Backend API running (Firm-specific)', 
+    connectedFirms,
+    totalSessions: firmSessions.size 
+  });
 });
 
 app.get('/api/whatsapp/status', (req, res) => {
-  res.json({ isConnected, hasQR: !!lastQrString });
+  const { firmId } = req.query;
+  if (!firmId) {
+    return res.status(400).json({ success: false, message: 'firmId is required' });
+  }
+
+  const firmSession = firmSessions.get(firmId);
+  if (!firmSession) {
+    return res.json({ isConnected: false, hasQR: false });
+  }
+
+  res.json({ 
+    isConnected: firmSession.isConnected, 
+    hasQR: !!firmSession.lastQrString,
+    firmId 
+  });
 });
 
 // Return latest QR as a data URL for the frontend to render
 app.get('/api/whatsapp/qr', async (req, res) => {
   try {
-    if (!lastQrString) return res.status(404).json({ success: false, message: 'QR not available yet' });
-    const dataUrl = await QRCode.toDataURL(lastQrString, { margin: 1, scale: 8 });
-    return res.json({ success: true, qrCode: dataUrl });
+    const { firmId } = req.query;
+    if (!firmId) {
+      return res.status(400).json({ success: false, message: 'firmId is required' });
+    }
+
+    const firmSession = firmSessions.get(firmId);
+    if (!firmSession || !firmSession.lastQrString) {
+      return res.status(404).json({ success: false, message: 'QR not available yet for this firm' });
+    }
+
+    const dataUrl = await QRCode.toDataURL(firmSession.lastQrString, { margin: 1, scale: 8 });
+    return res.json({ success: true, qrCode: dataUrl, firmId });
   } catch (e) {
     console.error('qr endpoint error:', e);
     return res.status(500).json({ success: false, message: 'Failed to render QR' });
@@ -323,11 +370,23 @@ app.get('/api/whatsapp/qr', async (req, res) => {
 
 app.post('/api/whatsapp/generate-qr', async (req, res) => {
   try {
-    if (!sock) await initializeWhatsApp();
+    const { firmId } = req.body;
+    if (!firmId) {
+      return res.status(400).json({ success: false, message: 'firmId is required' });
+    }
 
-    // We don't force regeneration; Baileys emits a new QR periodically.
-    // Here we just return a hint; actual QR is printed in the server console.
-    res.json({ success: true, message: 'QR printed in server console', hasQR: !!lastQrString });
+    const firmSession = firmSessions.get(firmId);
+    if (!firmSession || !firmSession.sock) {
+      await initializeWhatsApp(firmId);
+    }
+
+    const updatedSession = firmSessions.get(firmId);
+    res.json({ 
+      success: true, 
+      message: `QR printed in server console for firm ${firmId}`, 
+      hasQR: !!updatedSession?.lastQrString,
+      firmId 
+    });
   } catch (e) {
     console.error('generate-qr error:', e);
     res.status(500).json({ success: false, message: 'Failed to start WhatsApp' });
@@ -336,13 +395,22 @@ app.post('/api/whatsapp/generate-qr', async (req, res) => {
 
 app.post('/api/whatsapp/send-message', async (req, res) => {
   try {
-    const { number, message } = req.body;
-    if (!sock || !isConnected) return res.status(400).json({ success: false, message: 'WhatsApp not connected' });
-    if (!number || !message) return res.status(400).json({ success: false, message: 'number and message required' });
+    const { firmId, number, message } = req.body;
+    if (!firmId) {
+      return res.status(400).json({ success: false, message: 'firmId is required' });
+    }
+    if (!number || !message) {
+      return res.status(400).json({ success: false, message: 'number and message required' });
+    }
+
+    const firmSession = firmSessions.get(firmId);
+    if (!firmSession || !firmSession.sock || !firmSession.isConnected) {
+      return res.status(400).json({ success: false, message: 'WhatsApp not connected for this firm' });
+    }
 
     const jid = number.replace(/[+\s-]/g, '') + '@s.whatsapp.net';
-    await sock.sendMessage(jid, { text: message });
-    res.json({ success: true });
+    await firmSession.sock.sendMessage(jid, { text: message });
+    res.json({ success: true, firmId });
   } catch (e) {
     console.error('send-message error:', e);
     res.status(500).json({ success: false, message: 'Failed to send message' });
@@ -351,14 +419,22 @@ app.post('/api/whatsapp/send-message', async (req, res) => {
 
 app.post('/api/whatsapp/send-test-message', async (req, res) => {
   try {
-    if (!sock || !isConnected) return res.status(400).json({ success: false, message: 'WhatsApp not connected' });
+    const { firmId } = req.body;
+    if (!firmId) {
+      return res.status(400).json({ success: false, message: 'firmId is required' });
+    }
+
+    const firmSession = firmSessions.get(firmId);
+    if (!firmSession || !firmSession.sock || !firmSession.isConnected) {
+      return res.status(400).json({ success: false, message: 'WhatsApp not connected for this firm' });
+    }
 
     const testNumber = '+919106403233';
-    const testMessage = '🎉 Test message from your WhatsApp integration! Connection is working perfectly.';
+    const testMessage = `🎉 Test message from firm ${firmId}'s WhatsApp integration! Connection is working perfectly.`;
     
     const jid = testNumber.replace(/[+\s-]/g, '') + '@s.whatsapp.net';
-    await sock.sendMessage(jid, { text: testMessage });
-    res.json({ success: true, message: 'Test message sent successfully!' });
+    await firmSession.sock.sendMessage(jid, { text: testMessage });
+    res.json({ success: true, message: 'Test message sent successfully!', firmId });
   } catch (e) {
     console.error('send-test-message error:', e);
     res.status(500).json({ success: false, message: 'Failed to send test message' });
@@ -367,27 +443,33 @@ app.post('/api/whatsapp/send-test-message', async (req, res) => {
 
 app.post('/api/whatsapp/disconnect', async (req, res) => {
   try {
-    console.log('[WA] Disconnecting WhatsApp...');
+    const { firmId } = req.body;
+    if (!firmId) {
+      return res.status(400).json({ success: false, message: 'firmId is required' });
+    }
+
+    console.log(`[WA] Disconnecting WhatsApp for firm ${firmId}...`);
     
-    if (sock) {
-      await sock.logout();
+    const firmSession = firmSessions.get(firmId);
+    if (firmSession && firmSession.sock) {
+      await firmSession.sock.logout();
     }
     
-    sock = null;
-    isConnected = false;
-    lastQrString = null;
+    // Clear session from memory and Supabase
+    if (firmSessions.has(firmId)) {
+      firmSessions.delete(firmId);
+    }
 
-    // Clear session from Supabase
     try {
-      await saveSessionToSupabase(null);
-      console.log('[Auth] Session cleared from Supabase');
+      await saveSessionToSupabase(firmId, null);
+      console.log(`[Auth] Session cleared from Supabase for firm ${firmId}`);
     } catch (e) {
-      console.error('[Auth] Failed to clear session from Supabase:', e);
+      console.error(`[Auth] Failed to clear session from Supabase for firm ${firmId}:`, e);
     }
 
-    res.json({ success: true, message: 'WhatsApp disconnected and session cleared' });
+    res.json({ success: true, message: `WhatsApp disconnected and session cleared for firm ${firmId}`, firmId });
   } catch (e) {
-    console.error('[WA] Disconnect error:', e);
+    console.error('disconnect error:', e);
     res.status(500).json({ success: false, message: 'Failed to disconnect WhatsApp' });
   }
 });
@@ -395,15 +477,21 @@ app.post('/api/whatsapp/disconnect', async (req, res) => {
 // --- Server start ---
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  console.log('Initializing WhatsApp...');
-  initializeWhatsApp();
+  console.log('WhatsApp Backend ready for firm-specific connections');
+  console.log('Use POST /api/whatsapp/generate-qr with firmId to start a session');
 });
 
 // --- Graceful shutdown ---
 process.on('SIGINT', async () => {
   console.log('Shutting down...');
   try {
-    if (sock) await sock.logout();
+    // Disconnect all firm sessions
+    for (const [firmId, session] of firmSessions.entries()) {
+      if (session.sock) {
+        console.log(`Disconnecting firm ${firmId}...`);
+        await session.sock.logout();
+      }
+    }
   } catch (_) {}
   process.exit(0);
 });
