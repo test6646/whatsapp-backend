@@ -443,6 +443,77 @@ app.post('/api/whatsapp/send-test-message', async (req, res) => {
   }
 });
 
+// Add multer for file uploads
+const multer = require('multer');
+const upload = multer();
+
+app.post('/whatsapp/send-document', upload.single('document'), async (req, res) => {
+  try {
+    const { to, message, filename } = req.body;
+    const document = req.file;
+
+    if (!to || !message || !document) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Missing required parameters: to, message, and document file' 
+      });
+    }
+
+    // Extract firmId from session or determine it based on the current session
+    // For now, we'll use the current firm ID or the first connected firm
+    let targetFirmId = currentFirmId;
+    if (!targetFirmId) {
+      // Find the first connected firm
+      for (const [firmId, session] of firmSessions.entries()) {
+        if (session.isConnected) {
+          targetFirmId = firmId;
+          break;
+        }
+      }
+    }
+
+    if (!targetFirmId) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'No active WhatsApp session found' 
+      });
+    }
+
+    const firmSession = firmSessions.get(targetFirmId);
+    if (!firmSession || !firmSession.sock || !firmSession.isConnected) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'WhatsApp not connected for this firm' 
+      });
+    }
+
+    // Format phone number for WhatsApp
+    const jid = to.replace(/[+\s-]/g, '') + '@s.whatsapp.net';
+    
+    // Send document with message
+    await firmSession.sock.sendMessage(jid, {
+      document: document.buffer,
+      fileName: filename || document.originalname,
+      caption: message,
+      mimetype: document.mimetype
+    });
+
+    console.log(`Document sent successfully to ${to} from firm ${targetFirmId}`);
+    res.json({ 
+      success: true, 
+      message: 'Document sent successfully',
+      firmId: targetFirmId 
+    });
+
+  } catch (error) {
+    console.error('send-document error:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Failed to send document: ' + error.message 
+    });
+  }
+});
+
 app.post('/api/whatsapp/disconnect', async (req, res) => {
   try {
     const { firmId } = req.body;
