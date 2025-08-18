@@ -144,11 +144,18 @@ async function initializeWhatsApp(firmId) {
     if (savedSession && savedSession.creds) {
       console.log(`[Auth] Restoring session from Supabase for firm ${firmId}...`);
       try {
-        // Write credentials file
+        // Write all session files from Supabase
         if (savedSession.creds) {
           fs.writeFileSync(path.join(sessionDir, 'creds.json'), JSON.stringify(savedSession.creds, null, 2));
           console.log('[Auth] ✅ Restored creds.json');
         }
+        if (savedSession.keys) {
+          fs.writeFileSync(path.join(sessionDir, 'app-state-sync-key-0.json'), JSON.stringify(savedSession.keys, null, 2));
+          console.log('[Auth] ✅ Restored app-state-sync-key-0.json');
+        }
+        
+         // Reload auth state after restoring files
+        ({ state, saveCreds } = await useMultiFileAuthState(sessionDir));
         
         // Write all key files
         if (savedSession.keys && typeof savedSession.keys === 'object') {
@@ -547,11 +554,54 @@ app.post('/api/whatsapp/disconnect', async (req, res) => {
   }
 });
 
+// --- Auto-restore sessions for all firms on startup ---
+async function restoreAllFirmSessions() {
+  try {
+    console.log('[Startup] Checking for existing WhatsApp sessions to restore...');
+    
+    // Get all firms with stored WhatsApp sessions
+    const { data: sessions, error } = await supabase
+      .from('wa_sessions')
+      .select('firm_id, session_data')
+      .not('session_data', 'is', null);
+
+    if (error) {
+      console.error('[Startup] Error fetching stored sessions:', error);
+      return;
+    }
+
+    if (!sessions || sessions.length === 0) {
+      console.log('[Startup] No stored WhatsApp sessions found');
+      return;
+    }
+
+    console.log(`[Startup] Found ${sessions.length} stored sessions. Attempting to restore...`);
+    
+    // Initialize WhatsApp for each firm with stored session
+    for (const session of sessions) {
+      try {
+        console.log(`[Startup] Restoring WhatsApp session for firm: ${session.firm_id}`);
+        // Add a small delay between initializations to avoid overwhelming the service
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        await initializeWhatsApp(session.firm_id);
+      } catch (error) {
+        console.error(`[Startup] Failed to restore session for firm ${session.firm_id}:`, error);
+      }
+    }
+    
+    console.log('[Startup] ✅ Session restoration process completed');
+  } catch (error) {
+    console.error('[Startup] Error during session restoration:', error);
+  }
+}
+
 // --- Server start ---
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`Server running on port ${PORT}`);
   console.log('WhatsApp Backend ready for firm-specific connections');
-  console.log('Use POST /api/whatsapp/generate-qr with firmId to start a session');
+  
+  // Auto-restore all firm sessions on startup
+  await restoreAllFirmSessions();
 });
 
 // --- Graceful shutdown ---
