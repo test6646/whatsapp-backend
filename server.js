@@ -253,6 +253,18 @@ async function initializeWhatsApp(firmId) {
         firmSession.isConnected = true;
         firmSession.lastQrString = null;
         firmSession.reconnectAttempts = 0;
+        
+        // Immediately create/update session entry in Supabase so other admins can see connection status
+        try {
+          await saveSessionToSupabase(firmId, {
+            connected: true,
+            timestamp: new Date().toISOString(),
+            status: 'connected'
+          });
+          console.log(`[WA] ✅ Session status saved to Supabase for firm ${firmId}`);
+        } catch (e) {
+          console.error(`[WA] Failed to save connection status to Supabase for firm ${firmId}:`, e);
+        }
       }
     });
 
