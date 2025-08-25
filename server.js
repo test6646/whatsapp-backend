@@ -384,16 +384,62 @@ app.post('/api/whatsapp/generate-qr', async (req, res) => {
       return res.status(400).json({ success: false, message: 'firmId is required' });
     }
 
+    console.log(`[QR] Generate QR request for firm: ${firmId}`);
+    
     const firmSession = firmSessions.get(firmId);
-    if (!firmSession || !firmSession.sock) {
-      await initializeWhatsApp(firmId);
+    
+    // If already connected, don't generate new QR
+    if (firmSession && firmSession.isConnected) {
+      return res.json({ 
+        success: true, 
+        message: `WhatsApp already connected for firm ${firmId}`, 
+        hasQR: false,
+        isConnected: true,
+        firmId 
+      });
     }
 
-    const updatedSession = firmSessions.get(firmId);
+    // Clear any existing session for this firm to force fresh QR generation
+    if (firmSession && firmSession.sock) {
+      try {
+        await firmSession.sock.logout();
+      } catch (e) {
+        console.log(`[QR] Error logging out existing session: ${e.message}`);
+      }
+    }
+    
+    // Remove the session to force re-initialization
+    firmSessions.delete(firmId);
+    
+    // Initialize WhatsApp and wait for QR generation
+    await initializeWhatsApp(firmId);
+    
+    // Wait up to 10 seconds for QR generation
+    let attempts = 0;
+    const maxAttempts = 20; // 10 seconds with 500ms intervals
+    
+    while (attempts < maxAttempts) {
+      const updatedSession = firmSessions.get(firmId);
+      if (updatedSession && updatedSession.lastQrString) {
+        console.log(`[QR] QR generated successfully for firm ${firmId}`);
+        return res.json({ 
+          success: true, 
+          message: `QR generated for firm ${firmId}`, 
+          hasQR: true,
+          firmId 
+        });
+      }
+      
+      await new Promise(resolve => setTimeout(resolve, 500));
+      attempts++;
+    }
+    
+    // If we reach here, QR wasn't generated within timeout
+    console.log(`[QR] QR generation timeout for firm ${firmId}`);
     res.json({ 
       success: true, 
-      message: `QR printed in server console for firm ${firmId}`, 
-      hasQR: !!updatedSession?.lastQrString,
+      message: `QR generation initiated for firm ${firmId}. Please wait a moment and try fetching again.`, 
+      hasQR: false,
       firmId 
     });
   } catch (e) {
