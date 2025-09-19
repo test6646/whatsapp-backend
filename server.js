@@ -124,11 +124,34 @@ async function saveSessionToSupabase(firmId, sessionData) {
       status = sessionData.status;
     }
 
+    // Get firm data to populate required fields
+    const { data: firmData, error: firmError } = await supabase
+      .from('firms')
+      .select('name, description, header_left_content, footer_content')
+      .eq('id', firmId)
+      .single();
+
+    let firmName = 'YOUR_FIRM_NAME';
+    let firmTagline = 'YOUR_FIRM_TAGLINE';
+    let contactInfo = 'Contact: YOUR_FIRM_CONTACT\nEmail: YOUR_FIRM_CONTACT_EMAIL';
+    let footerSignature = 'YOUR_FIRM_NAME | Contact: YOUR_FIRM_CONTACT | Email: YOUR_FIRM_CONTACT_EMAIL\nYOUR_FIRM_TAGLINE | YOUR_FIRM_SIGNATURE';
+
+    if (firmData && !firmError) {
+      firmName = firmData.name || firmName;
+      firmTagline = firmData.description || firmTagline;
+      contactInfo = firmData.header_left_content || contactInfo;
+      footerSignature = firmData.footer_content || footerSignature;
+    }
+
     const { error } = await supabase
       .from('wa_sessions')
       .upsert({ 
         id: firmId, 
         firm_id: firmId, // CRITICAL: Set firm_id for firm ownership
+        firm_name: firmName,
+        firm_tagline: firmTagline,
+        contact_info: contactInfo,
+        footer_signature: footerSignature,
         status: status,
         session_data: sessionData,
         updated_at: new Date().toISOString() 
