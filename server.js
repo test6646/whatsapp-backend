@@ -157,23 +157,6 @@ async function initializeWhatsApp(firmId) {
   try {
     console.log(`[WA] Initializing WhatsApp for firm: ${firmId} with Supabase session persistence...`);
     
-    // CRITICAL: Update firm info in wa_sessions before starting WhatsApp
-    try {
-      console.log(`[WA] Updating firm info for firm: ${firmId}`);
-      const { error: firmUpdateError } = await supabase.functions.invoke('update-whatsapp-firm-info', {
-        body: { firmId }
-      });
-      
-      if (firmUpdateError) {
-        console.warn(`[WA] Failed to update firm info for ${firmId}:`, firmUpdateError);
-      } else {
-        console.log(`[WA] ✅ Firm info updated successfully for ${firmId}`);
-      }
-    } catch (updateError) {
-      console.warn(`[WA] Firm info update failed for ${firmId}:`, updateError);
-      // Continue with WhatsApp initialization even if firm info update fails
-    }
-    
     // Create a firm-specific session directory
     const sessionDir = `./wa_session_${firmId}`;
     if (!fs.existsSync(sessionDir)) {
@@ -237,7 +220,7 @@ async function initializeWhatsApp(firmId) {
       browser: ['WhatsApp Web', 'Chrome', '1.0.0'],
       syncFullHistory: false,
       generateHighQualityLinkPreview: false,
-      qrTimeout: 60000, // 60 seconds for QR timeout (1 minute)
+      qrTimeout: 60000, // 60 seconds for QR timeout
       connectTimeoutMs: 45000, // 45 seconds for connection timeout
       retryRequestDelayMs: 3000, // 3 seconds between retries
       maxMsgRetryCount: 2, // Maximum 2 retries to prevent excessive retries
@@ -253,75 +236,16 @@ async function initializeWhatsApp(firmId) {
 
       if (qr) {
         firmSession.lastQrString = qr;
-        firmSession.qrGeneratedAt = Date.now(); // Track QR generation time
         console.log(`[QR] ✅ QR code generated for firm ${firmId}`);
         
-        // Auto-clear QR after 1 minute (60 seconds)
-        setTimeout(() => {
-          if (firmSession.lastQrString === qr && !firmSession.isConnected) {
-            console.log(`[QR] ⏰ QR expired for firm ${firmId} after 1 minute, clearing session`);
-            firmSession.lastQrString = null;
-            firmSession.qrGeneratedAt = null;
-            
-            // Clear session and disconnect socket
-            if (firmSession.sock) {
-              try {
-                firmSession.sock.end();
-              } catch (e) {
-                console.warn(`[QR] Failed to end socket for firm ${firmId}:`, e);
-              }
-              firmSession.sock = null;
-            }
-            
-            // Update Supabase to reflect expired state
-            saveSessionToSupabase(firmId, {
-              qr_expired: true,
-              timestamp: new Date().toISOString(),
-              status: 'qr_expired'
-            }).catch(e => console.error(`[QR] Failed to save expired status for firm ${firmId}:`, e));
-          }
-        }, 60000); // 60 seconds = 1 minute
-        
-        // Update firm info in wa_sessions immediately when QR is generated
+        // Save QR availability status to Supabase immediately
         try {
-          // First, get firm information from the firms table
-          const { data: firmData, error: firmError } = await supabase
-            .from('firms')
-            .select('name, description, header_left_content, footer_content')
-            .eq('id', firmId)
-            .single();
-
-          if (firmData && !firmError) {
-            // Update wa_sessions with real firm information
-            await supabase
-              .from('wa_sessions')
-              .upsert({
-                id: firmId,
-                firm_id: firmId,
-                firm_name: firmData.name,
-                firm_tagline: firmData.description || '',
-                contact_info: firmData.header_left_content || '',
-                footer_signature: firmData.footer_content || '',
-                session_data: {
-                  qr_available: true,
-                  timestamp: new Date().toISOString(),
-                  status: 'qr_generated'
-                },
-                status: 'qr_generated',
-                qr_expires_at: new Date(Date.now() + 60000).toISOString(), // Expires in 1 minute
-                updated_at: new Date().toISOString()
-              }, { onConflict: 'id' });
-            
-            console.log(`[QR] ✅ Real firm info and QR status saved to Supabase for firm ${firmId}: ${firmData.name}`);
-          } else {
-            // Fallback - save QR status without firm info
-            await saveSessionToSupabase(firmId, {
-              qr_available: true,
-              timestamp: new Date().toISOString(),
-              status: 'qr_generated'
-            });
-            console.log(`[QR] ⚠️ QR status saved without firm info for firm ${firmId}:`, firmError?.message);
-          }
+          await saveSessionToSupabase(firmId, {
+            qr_available: true,
+            timestamp: new Date().toISOString(),
+            status: 'qr_generated'
+          });
+          console.log(`[QR] QR status saved to Supabase for firm ${firmId}`);
         } catch (e) {
           console.error(`[QR] Failed to save QR status to Supabase for firm ${firmId}:`, e);
         }
@@ -393,47 +317,16 @@ async function initializeWhatsApp(firmId) {
         firmSession.lastQrString = null;
         firmSession.reconnectAttempts = 0;
         
-        // Update firm info and connection status in wa_sessions
+        // Immediately create/update session entry in Supabase so other admins can see connection status
         try {
-          // Get firm information and update wa_sessions with real data
-          const { data: firmData, error: firmError } = await supabase
-            .from('firms')
-            .select('name, description, header_left_content, footer_content')
-            .eq('id', firmId)
-            .single();
-
-          const firmInfo = firmData && !firmError ? {
-            firm_name: firmData.name,
-            firm_tagline: firmData.description || '',
-            contact_info: firmData.header_left_content || '',
-            footer_signature: firmData.footer_content || ''
-          } : {};
-
-          await supabase
-            .from('wa_sessions')
-            .upsert({
-              id: firmId,
-              firm_id: firmId,
-              ...firmInfo,
-              session_data: {
-                connected: true,
-                timestamp: new Date().toISOString(),
-                status: 'connected'
-              },
-              status: 'connected',
-              qr_expires_at: null, // Clear QR expiry since we're connected
-              updated_at: new Date().toISOString()
-            }, { onConflict: 'id' });
-          
-          console.log(`[WA] ✅ Real firm info and connection status saved to Supabase for firm ${firmId}: ${firmData?.name || firmId}`);
-        } catch (e) {
-          console.error(`[WA] Failed to save connection status to Supabase for firm ${firmId}:`, e);
-          // Fallback - save connection status without firm info
           await saveSessionToSupabase(firmId, {
             connected: true,
             timestamp: new Date().toISOString(),
             status: 'connected'
           });
+          console.log(`[WA] ✅ Session status saved to Supabase for firm ${firmId}`);
+        } catch (e) {
+          console.error(`[WA] Failed to save connection status to Supabase for firm ${firmId}:`, e);
         }
       }
     });
@@ -561,22 +454,6 @@ app.get('/api/whatsapp/qr', async (req, res) => {
     const firmSession = firmSessions.get(firmId);
     if (!firmSession || !firmSession.lastQrString) {
       return res.status(404).json({ success: false, message: 'QR not available yet for this firm' });
-    }
-
-    // Check if QR has expired (1 minute = 60000ms)
-    if (firmSession.qrGeneratedAt && Date.now() - firmSession.qrGeneratedAt > 60000) {
-      console.log(`[QR] QR expired for firm ${firmId}, clearing session`);
-      firmSession.lastQrString = null;
-      firmSession.qrGeneratedAt = null;
-      
-      // Clear session in Supabase
-      await saveSessionToSupabase(firmId, {
-        qr_expired: true,
-        timestamp: new Date().toISOString(),
-        status: 'qr_expired'
-      });
-      
-      return res.status(410).json({ success: false, message: 'QR code has expired. Please generate a new one.' });
     }
 
     const dataUrl = await QRCode.toDataURL(firmSession.lastQrString, { margin: 1, scale: 8 });
