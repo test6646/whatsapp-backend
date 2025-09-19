@@ -114,14 +114,19 @@ async function saveSessionToSupabase(firmId, sessionData) {
 
     console.log(`[Auth] Saving session to Supabase for firm ${firmId} with keys:`, Object.keys(sessionData));
     
-    // Determine status based on session data
+    // Determine status based on session data - preserve existing status if not explicitly changing
     let status = 'disconnected';
+    let preserveExistingStatus = false;
+    
     if (sessionData.connected || sessionData.status === 'connected') {
       status = 'connected';
     } else if (sessionData.qr_available || sessionData.status === 'qr_generated') {
       status = 'qr_generated';
     } else if (sessionData.status) {
       status = sessionData.status;
+    } else if (sessionData.creds || sessionData.keys) {
+      // If only saving credentials/keys without explicit status, preserve existing status
+      preserveExistingStatus = true;
     }
 
     // Get firm data to populate required fields
@@ -143,19 +148,26 @@ async function saveSessionToSupabase(firmId, sessionData) {
       footerSignature = firmData.footer_content || footerSignature;
     }
 
+    // Build upsert data
+    const upsertData = { 
+      id: firmId, 
+      firm_id: firmId, // CRITICAL: Set firm_id for firm ownership
+      firm_name: firmName,
+      firm_tagline: firmTagline,
+      contact_info: contactInfo,
+      footer_signature: footerSignature,
+      session_data: sessionData,
+      updated_at: new Date().toISOString() 
+    };
+    
+    // Only update status if we're explicitly setting it, otherwise preserve existing
+    if (!preserveExistingStatus) {
+      upsertData.status = status;
+    }
+    
     const { error } = await supabase
       .from('wa_sessions')
-      .upsert({ 
-        id: firmId, 
-        firm_id: firmId, // CRITICAL: Set firm_id for firm ownership
-        firm_name: firmName,
-        firm_tagline: firmTagline,
-        contact_info: contactInfo,
-        footer_signature: footerSignature,
-        status: status,
-        session_data: sessionData,
-        updated_at: new Date().toISOString() 
-      }, { onConflict: 'id' });
+      .upsert(upsertData, { onConflict: 'id' });
 
     if (error) {
       console.error(`[Supabase] saveSession error for firm ${firmId}:`, error.message, error.details);
@@ -586,48 +598,38 @@ const upload = multer();
 
 app.post('/whatsapp/send-document', upload.single('document'), async (req, res) => {
   try {
-    const { to, message, filename } = req.body;
+    const { firmId, to, message, filename } = req.body;
     const document = req.file;
+
+    console.log(`[Document] Send request for firm: ${firmId}, to: ${to}`);
+
+    if (!firmId) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'firmId is required to send document' 
+      });
+    }
 
     if (!to || !message || !document) {
       return res.status(400).json({ 
         success: false, 
-        error: 'Missing required parameters: to, message, and document file' 
+        error: 'Missing required parameters: firmId, to, message, and document file' 
       });
     }
 
-    // Extract firmId from session or determine it based on the current session
-    // For now, we'll use the current firm ID or the first connected firm
-    let targetFirmId = currentFirmId;
-    if (!targetFirmId) {
-      // Find the first connected firm
-      for (const [firmId, session] of firmSessions.entries()) {
-        if (session.isConnected) {
-          targetFirmId = firmId;
-          break;
-        }
-      }
-    }
-
-    if (!targetFirmId) {
-      return res.status(400).json({ 
-        success: false, 
-        error: 'No active WhatsApp session found' 
-      });
-    }
-
-    const firmSession = firmSessions.get(targetFirmId);
+    // Use the specific firm's WhatsApp session
+    const firmSession = firmSessions.get(firmId);
     if (!firmSession || !firmSession.sock || !firmSession.isConnected) {
       return res.status(400).json({ 
         success: false, 
-        error: 'WhatsApp not connected for this firm' 
+        error: `WhatsApp not connected for firm ${firmId}. Please connect WhatsApp for this firm first.` 
       });
     }
 
     // Format phone number for WhatsApp
     const jid = to.replace(/[+\s-]/g, '') + '@s.whatsapp.net';
     
-    // Send document with message
+    // Send document with message using the specific firm's WhatsApp connection
     await firmSession.sock.sendMessage(jid, {
       document: document.buffer,
       fileName: filename || document.originalname,
@@ -635,11 +637,11 @@ app.post('/whatsapp/send-document', upload.single('document'), async (req, res) 
       mimetype: document.mimetype
     });
 
-    console.log(`Document sent successfully to ${to} from firm ${targetFirmId}`);
+    console.log(`✅ Document sent successfully to ${to} from firm ${firmId}`);
     res.json({ 
       success: true, 
       message: 'Document sent successfully',
-      firmId: targetFirmId 
+      firmId: firmId 
     });
 
   } catch (error) {
