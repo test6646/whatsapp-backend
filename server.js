@@ -460,6 +460,11 @@ app.get('/', (req, res) => {
   });
 });
 
+// Add this to your Express server
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'healthy', timestamp: new Date().toISOString() });
+});
+
 app.get('/api/whatsapp/status', (req, res) => {
   const { firmId } = req.query;
   if (!firmId) {
